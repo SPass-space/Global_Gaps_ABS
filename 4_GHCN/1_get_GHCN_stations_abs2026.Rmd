@@ -1,0 +1,394 @@
+---
+title: "weather_stations"
+output: html_document
+date: "2025-07-17"
+---
+
+----------------------------------------------------------------------------------------------------------
+This scipt if for gathering information from NOAA's Global Historical Climatology Network daily (GHCNd) land surface stations around the globe. It rasterizes the points from 2010-2024
+-------------------------------------------------------------------------------------------------
+
+
+```{r}
+#Librariers needed
+library(readr)
+library(dplyr)
+library(sf)
+library(terra)
+library(data.table)
+```
+
+
+
+```{r}
+# Download and read station metadata
+station_url <- "https://www1.ncdc.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt"
+
+#reads station text files and creates a dataframe with station ids
+stations <- read_fwf(station_url, fwf_cols(
+  station_id = c(1, 11),
+  latitude = c(13, 20),
+  longitude = c(22, 30),
+  elevation = c(32, 37),
+  state = c(39, 40),
+  name = c(42, 71),
+  gsn_flag = c(73, 75),
+  hcn_flag = c(77, 79),
+  wmo_id = c(81, 85)
+))
+```
+
+
+```{r}
+#collects a general dataframe with dates of the stations start year and end year
+inv_url <- "https://www1.ncdc.noaa.gov/pub/data/ghcn/daily/ghcnd-inventory.txt"
+
+inventory <- read_fwf(inv_url, fwf_cols(
+  station_id = c(1, 11),
+  latitude = c(13, 20),
+  longitude = c(22, 30),
+  element = c(31, 35),
+  first_year = c(37, 40),
+  last_year = c(42, 45)
+))
+#filter for years 2010 to 2024
+filtered <- inventory %>%
+  filter(last_year >= 2010 & first_year <= 2024) %>%
+  select(-element) %>% # this has TMIN and different measurements at each station. Could keep if want this. 
+  distinct(station_id, .keep_all = TRUE) # Keep only unique station ids
+
+# Join with station metadata for coordinates
+stations_filtered <- left_join(filtered, stations, by = c("station_id", "longitude", "latitude"))
+
+# Convert to sf points
+sf_points <- st_as_sf(stations_filtered, coords = c("longitude", "latitude"), crs = 4326)
+
+
+```
+
+
+```{r}
+#This section opens up each individual dly station file (of 77,355) and checks which years they were active between 2010 to 2024.
+
+# Setup parallel processing
+plan(multisession, workers = 4) 
+
+# Years of interest
+years_to_check <- 2010:2024
+
+# Function to check which years are active for a given station_id
+get_active_years_from_ghcn <- function(station_id) {
+  tryCatch({
+    url <- sprintf("https://www.ncei.noaa.gov/pub/data/ghcn/daily/all/%s.dly", station_id)
+
+    # Read only header lines (first 21 characters include year and month info)
+    raw_lines <- read_lines(url, progress = FALSE)
+    
+    if (length(raw_lines) == 0) {
+      warning(paste("Empty or unreadable file for station:", station_id))
+      return(rep(FALSE, length(years_to_check)))
+    }
+
+    # Extract years from fixed-width format
+    years <- str_sub(raw_lines, 12, 15) |> as.integer()
+    years <- years[!is.na(years)]
+
+    # Check which years are present
+    active_flags <- years_to_check %in% years
+
+    message(paste0("Station: ", station_id, " | Years found: ", paste(unique(years), collapse = ", ")))
+
+    return(active_flags)
+
+  }, error = function(e) {
+    warning(paste("Error with station:", station_id, "->", e$message))
+    return(rep(FALSE, length(years_to_check)))
+  })
+}
+
+# Split into chunks if memory becomes a problem
+stations_split <- split(stations_filtered, (seq_len(nrow(stations_filtered)) - 1) %/% 100)
+
+# Process each chunk
+results_list <- map(stations_split, function(chunk_df) {
+  future_map(chunk_df$station_id, get_active_years_from_ghcn, .progress = TRUE)
+})
+
+# Combine results back into a full matrix
+active_year_matrix <- do.call(rbind, lapply(results_list, function(x) do.call(rbind, x)))
+
+# Bind the results back to the original dataframe
+colnames(active_year_matrix) <- as.character(years_to_check)
+
+stations_with_year_flags <- bind_cols(
+  stations_filtered,
+  as_tibble(active_year_matrix)
+)
+
+# write_csv(stations_with_year_flags, "stations_with_active_years.csv")
+
+
+```
+
+
+```{r}
+#read back in station chunks from the folder where they exist. You need to put your own folder in the list.files
+station_files <- list.files("weather_stations", pattern = "\\.csv$", full.names = TRUE)
+
+station_df <- rbindlist(lapply(station_files, fread))
+```
+
+
+
+
+
+```{r}
+
+crs_moll <- st_crs("ESRI:54009")$wkt
+
+
+weather_complete <- station_df %>%
+  filter(!is.na(latitude) , !is.na(longitude) , !is.na(station_id),
+  # filter out profiles with incorrect longitude and latitudes
+  longitude >= (-180) & longitude <= 180,  
+  latitude >= (-90) & latitude <= 90)
+
+weather_stations_sf <- st_as_sf(weather_complete, coords = c("longitude", "latitude"), crs = 4326)
+
+plot(weather_stations_sf[,1])
+#make a version in mollweide for better processing
+weather_sts_moll_sf <- st_transform(weather_stations_sf, crs_moll)
+```
+
+```{r}
+
+
+#find the number of weather stations
+length(unique(weather_stations_sf$station_id)) #77355
+```
+Raster Profile creations
+
+```{r}
+obs_years <- 2010:2024
+crs_moll <- st_crs("ESRI:54009")$wkt
+
+generate_weather_profiles <- function(stations_sf, target_crs, template, out_subdir) {
+  dir.create(out_subdir, recursive = TRUE, showWarnings = FALSE)
+  
+  weather_stack <- list()
+  for (year in obs_years) {
+    message("Processing year: ", year)
+    year_col <- as.character(year)
+    
+    # Filter for stations active this year
+    weather_active <- stations_sf %>% filter(.data[[year_col]] == TRUE)
+    
+    # Transform points to the target projection
+    weather_active <- st_transform(weather_active, target_crs)
+    
+    # Skip if no stations that year
+    if (nrow(weather_active) == 0) {
+      warning("No stations active in ", year)
+      weather_stack[[year_col]] <- rast(template)
+      next
+    }
+    
+    # Rasterize station presence (counts per cell)
+    weather_rast <- rasterize(vect(weather_active), template, field = NA, fun = "sum", background = 0)
+    weather_stack[[year_col]] <- weather_rast
+  }
+  
+  weather_stack <- rast(weather_stack)
+  names(weather_stack) <- paste0("year_", obs_years)
+  
+  # Save each yearly raster
+  for (i in 1:nlyr(weather_stack)) {
+    writeRaster(weather_stack[[i]],
+                file.path(out_subdir, paste0("weather_prof_", obs_years[i], ".tif")),
+                overwrite = TRUE)
+  }
+  return(weather_stack)
+}
+
+#1 degree resolution templates
+template_4326 <- rast(ext(-180, 180, -90, 90), resolution = 1, crs = "EPSG:4326")
+template_moll <- project(template_4326, crs_moll, method = "near", res = 100000)
+
+
+# RUN FOR BOTH PROJECTIONS
+
+# Mollweide (used for area analysis)
+generate_weather_profiles(weather_sts_moll_sf, crs_moll, template_moll, "GHCN_terr/profiles")
+
+# EPSG:4326 (used for plotting)
+generate_weather_profiles(weather_stations_sf , "EPSG:4326", template_4326, "GHCN_terr/profiles/esri4326")
+
+```
+
+
+
+```{r}
+
+#create ocean mask
+ocean_mask <- ne_download(scale = "medium", type = "ocean", category = "physical", returnclass = "sf")
+ocean_mask <- rasterize(vect(ocean_mask), weather_mask, field = 1)
+#mollweide ocean mask
+ocean_mask_moll <- project(ocean_mask, crs(rast(weather_stack[[1]])))
+
+#land mask
+land_mask <- ne_download(scale = "medium", type = "land", category = "physical", returnclass = "sf")
+land_mask <- rasterize(vect(land_mask), weather_mask, field = 1)
+land_mask_moll <- project(land_mask, crs(rast(weather_stack[[1]])))
+crs_moll <- st_crs("ESRI:54009")$wkt
+
+```
+
+
+
+
+```{r}
+land_mask_sf <- ne_download(scale = "medium", type = "land", category = "physical", returnclass = "sf")
+land_mask_vect <- vect(land_mask_sf)
+
+out_directory <- "GHCN_terr/coldspots/"
+dir.create(out_directory, recursive = TRUE, showWarnings = FALSE)
+
+process_ghcn_coldspots <- function(ghcn_dir, proj_name, out_prefix) {
+  print(paste("Processing GHCN:", proj_name))
+  
+  # 1. Get files
+  all_files <- list.files(ghcn_dir, pattern = "\\.tif$", full.names = TRUE)
+  years_to_keep <- as.character(2010:2024)
+  ghcn_files <- all_files[grepl(paste(years_to_keep, collapse = "|"), all_files)]
+  if(length(ghcn_files) == 0) stop("No .tif files found in the directory!")
+  
+  # 2. Read reference raster and align
+  ref_rast <- rast(ghcn_files[1])
+  ref_crs <- crs(ref_rast)
+  
+  aligned_rasters <- lapply(ghcn_files, function(f) {
+    r <- rast(f)
+    crs(r) <- ref_crs 
+    if(!ext(r) == ext(ref_rast) || any(res(r) != res(ref_rast))) {
+      r <- resample(r, ref_rast, method = "near") 
+    }
+    return(r)
+  })
+  
+  ghcn_stack <- rast(aligned_rasters)
+  
+  # 3. Prepare Land Mask
+  suppressWarnings({
+    land_mask_proj <- project(land_mask_vect, crs(ghcn_stack))
+  })
+  land_mask_rast <- rasterize(land_mask_proj, ghcn_stack[[1]], field = 1)
+  
+  # 4. Calculate Cell Area
+   if (is.lonlat(ghcn_stack)) {
+    area_rast <- cellSize(ghcn_stack[[1]], unit = "km")
+    print("Using cellSize (geographic CRS detected)")
+   
+   } else {
+    res_xy <- res(ghcn_stack[[1]])
+    cell_area_km2 <- (res_xy[1] * res_xy[2]) / 1e6
+   area_rast <- rast(ghcn_stack[[1]])
+    values(area_rast) <- cell_area_km2
+    print(paste("Using planar method. Cell area (km2):", cell_area_km2))
+
+   area_rast2 <- cellSize(ghcn_stack[[1]], unit = "km")
+
+  }
+
+  gap_area_list <- list()
+  unsampled_list <- list() 
+  
+  # 5. Loop through years (EXACTLY matching your old logic)
+  for (i in 1:nlyr(ghcn_stack)) {
+    ghcn_rast <- ghcn_stack[[i]]
+    ghcn_rast <- mask(ghcn_rast, land_mask_rast)
+    
+    # Classify: 0 counts -> 1 (Un-sampled), >0 counts -> NA
+    unsamp_gap <- classify(ghcn_rast, matrix(c(-Inf, 0, 1, 0, Inf, NA), ncol = 3, byrow = TRUE))
+    
+    unsampled_list[[i]] <- unsamp_gap
+    
+    # Calculate gap area
+    gap_area_unsampled <- global(area_rast * (unsamp_gap == 1), sum, na.rm = TRUE)[1, 1]
+   # gap_area_unsampled2 <- global(area_rast2 * (unsamp_gap == 1), sum, na.rm = TRUE)[1, 1]
+    
+    gap_area_list[[i]] <- data.frame(
+      class = "Un-sampled",
+      year = 2010 + i - 1, 
+      area_km2 = gap_area_unsampled
+    )
+  }
+  
+  # 6. Persistence
+  unsampled_stack <- rast(unsampled_list)
+  names(unsampled_stack) <- paste0("year_", 2010:2024)
+  
+  gap_persistence <- app(unsampled_stack, function(x) {
+    sum(!is.na(x) & x > 0) / length(x)
+  })
+  gap_persistence <- mask(gap_persistence, land_mask_rast)
+  writeRaster(gap_persistence, paste0(out_directory, out_prefix, "_gap_persist2.tif"), overwrite = TRUE)
+  
+  # 7. Coldspot Mask (>= 80%)
+  coldspot_mask <- classify(gap_persistence, matrix(c(-Inf, 0.8, NA, 0.8, Inf, 1), ncol = 3, byrow = TRUE), right = FALSE)
+  
+  
+  coldspot_patches <- patches(coldspot_mask, directions = 4)
+  coldspot_polygons <- as.polygons(coldspot_patches, dissolve = TRUE)
+  coldspot_disaggregated <- terra::disagg(coldspot_polygons)
+  
+  cold_spot_sf <- st_as_sf(coldspot_disaggregated)
+  cold_spot_sf$area_sf <- as.numeric(st_area(cold_spot_sf)) / 1e6 
+  
+  large_coldspots_sf <- cold_spot_sf %>% filter(area_sf > 200000)
+  
+  # 9. Rasterize back
+  final_cold_spot_raster <- rasterize(vect(large_coldspots_sf), gap_persistence, field = 1)
+ writeRaster(final_cold_spot_raster, paste0(out_directory, out_prefix, "_final_coldspot2.tif"), overwrite = TRUE)
+  
+  # 10. Area Calculations
+  pre_filter_area <- sum(cold_spot_sf$area_sf)
+  total_cold_area <- sum(large_coldspots_sf$area_sf)
+  eliminated_area <- 1 - (total_cold_area / pre_filter_area)
+  
+  print(paste("Total Coldspot Area BEFORE filter (km2):", pre_filter_area))
+  print(paste("Total Large Coldspot Area (km2):", total_cold_area))
+  print(paste("Proportion of area eliminated by filter:", eliminated_area))
+  
+  # 11. Dataframe format
+  gap_area_df <- bind_rows(gap_area_list) %>%
+    mutate(
+      area_10k_km2 = area_km2 / 1e4,
+      projection = proj_name
+    )
+  
+ write.csv(gap_area_df, paste0(out_directory, out_prefix, "_gap_area_df.csv"), row.names = FALSE)
+  
+  return(gap_area_df)
+}
+```
+
+
+
+Different projections
+
+```{r}
+
+df_moll <- process_ghcn_coldspots(
+  ghcn_dir = "GHCN_terr/profiles",
+  proj_name = "Mollweide", 
+  out_prefix = "ws_moll"
+)
+
+
+df_4326 <- process_ghcn_coldspots(
+  ghcn_dir =  "GHCN_terr/profiles/esri4326", 
+  proj_name = "EPSG4326", 
+  out_prefix = "ws_4326"
+)
+```
+

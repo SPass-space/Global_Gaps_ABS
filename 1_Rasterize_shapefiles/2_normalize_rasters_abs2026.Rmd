@@ -1,0 +1,216 @@
+---
+title: "normalize_families"
+output: html_document
+date: "2025-05-09"
+---
+
+
+
+---------------------------------------------------------------------------------------
+This script normalizes all unique species range maps by family across land, air, and ocean
+---------------------------------------------------------------------------------
+
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(move2)
+library(httr)
+library(jsonlite)
+library(sf)
+library(terra)
+library(lubridate)
+library(tidyr)
+library(purrr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(tidyterra) 
+library(ggplot2)
+library(patchwork)
+library(ggspatial)
+```
+
+
+```{r}
+#get masks ready
+land_mask <- ne_download(scale= "medium", type = "land", category = "physical", returnclass = "sf")
+
+r_template <- rast(xmin = -180, xmax = 180, ymin = -90, ymax = 90, resolution =1, crs = "EPSG:4326")
+
+land_vect <- vect(land_mask )
+land_rast <- rasterize(land_vect, r_template, field = 1, touches = TRUE)
+
+ocean_mask <- ne_download(scale= "medium", type = "ocean", category = "physical", returnclass = "sf")
+
+
+ocean_vect <- vect(ocean_mask )
+ocean_rast <- rasterize(ocean_vect, r_template, field = 1, touches = TRUE)
+
+
+
+```
+
+
+
+Create normalization rasters based on family
+
+```{r}
+#use the mollweide family directory and out directory or the esri 4326 paths for different analyses
+
+
+# fam_direct <- "family_maps/mollweide"
+# out_norm_direct <- "normalized/mollweide"
+fam_direct <- "family_maps/esri_4326"
+out_norm_direct <- "normalized/esri_4326"
+
+
+if (grepl("esri_4326", fam_direct)){
+  out_end <- "4326"
+} else {
+  out_end <- "moll"
+}
+
+fam_list <- list.files(fam_direct, pattern = "\\.tif$", full.names = TRUE)
+
+# Bat families in the data
+bat_families <- c("Pteropodidae", "Phyllostomidae", "Vespertilionidae", 
+                  "Molossidae", "Emballonuridae", "Megadermatidae",
+                  "Rhinolophidae", "Myzopodidae", "Noctilionidae")
+
+
+# Seal families (Pinnipeds)
+seal_families <- c("Odobenidae", "Otariidae", "Phocidae")
+
+# Amphibious/Marine Reptiles & Turtles
+amphibious_families <- c("Cheloniidae", "Dermochelyidae", "Crocodylidae", "Emydidae")
+
+
+# Align masks
+target_crs <- crs(rast(fam_list[1]))
+land_mask <- st_transform(land_mask, target_crs)
+ocean_mask <- st_transform(ocean_mask, target_crs)
+
+# Build dataframe
+family_df <- data.frame(
+  full_path = fam_list,
+  base_name = basename(fam_list),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(family_name = sub("\\_.*", "", base_name)) %>% 
+  mutate(family_expression = sub("^.*?\\_","", base_name)) %>%
+  mutate(family_expression = sub("\\.tif.*", '', family_expression)) 
+
+# Create a "terrestrial_no_bats" group for a separate analysis
+no_bats_df <- family_df %>%
+  filter(family_expression == "terrestrial") %>%
+  filter(!family_name %in% bat_families) %>% 
+  mutate(family_expression = "terrestrial_no_bats") 
+
+# 2. Create the Appendix group: No bats, No Seals, and No Amphibious for a separate analysis
+appendix_df <- family_df %>%
+  filter(family_expression == "terrestrial") %>%
+  filter(!family_name %in% c(bat_families, seal_families, amphibious_families)) %>% 
+  mutate(family_expression = "terrestrial_supp_no_amphib") 
+
+# Bind extra analyses tags together 
+family_df <- bind_rows(family_df, no_bats_df, appendix_df)
+all_expressions <- unique(family_df$family_expression)
+
+
+
+#---------------------------------------------------------------------------------
+# Normalization Loop
+#---------------------------------------------------------------------------------
+
+for (ex in all_expressions){
+  cat("\nProcessing group:", ex ,"\n")
+  ex_df <- family_df %>% filter(family_expression == ex)
+  
+  # Determine which mask to use based on analysis
+  if(str_detect(tolower(ex), "terrestrial")){
+    active_mask <- land_mask
+  } else if(str_detect(tolower(ex), "marine")){
+    active_mask <- ocean_mask
+  } else {
+    active_mask <- NULL
+  }
+  
+  # Load rasters
+  exp_rasters <- lapply(ex_df$full_path, rast)
+  
+  # --- PREPARE RAW LAYERS (For Richness) ---
+  raw_layers <- lapply(exp_rasters, function(rast_layer){
+    if(!is.null(active_mask)) rast_layer <- mask(rast_layer, active_mask)
+    classify(rast_layer, cbind(NA, 0)) # Convert NAs to 0s for math
+  })
+  raw_stack <- rast(raw_layers)
+
+  # SPECIES RICHNESS (Sum of raw counts)
+
+  species_richness <- app(raw_stack, fun = "sum", na.rm = TRUE)
+  if(!is.null(active_mask)) species_richness <- mask(species_richness, active_mask)
+  
+  out_path_species <- file.path(out_norm_direct, paste0(ex,"_species_richness_", out_end, "touches.tif"))
+  writeRaster(species_richness, out_path_species, overwrite = TRUE)
+  cat("   Saved Species Richness\n")
+  
+
+  #  NORMALIZED SPECIES RICHNESS (0 to 1)
+
+  sr_max <- global(species_richness, fun = "max", na.rm = TRUE)[1,1]
+  sr_min <- global(species_richness, fun = "min", na.rm = TRUE)[1,1]
+  
+  if(!is.na(sr_max) && sr_max != sr_min) {
+    species_richness_norm <- (species_richness - sr_min) / (sr_max - sr_min)
+  } else {
+    species_richness_norm <- species_richness * 0 
+  }
+  
+  out_path_sr_norm <- file.path(out_norm_direct, paste0(ex,"_species_richness_normalized_", out_end, "touches.tif"))
+  writeRaster(species_richness_norm, out_path_sr_norm, overwrite = TRUE)
+
+
+
+  # FAMILY RICHNESS (Count of families present)
+
+  family_presence_stack <- raw_stack > 0 
+  family_richness <- app(family_presence_stack, fun = "sum", na.rm = TRUE)
+  if(!is.null(active_mask)) family_richness <- mask(family_richness, active_mask)
+  
+  out_path_family <- file.path(out_norm_direct, paste0(ex,"_family_richness_", out_end, "touches.tif"))
+  writeRaster(family_richness, out_path_family, overwrite = TRUE)
+
+
+
+  # NORMALIZED MEAN (0 to 1)
+
+  normalized_layers <- lapply(raw_layers, function(rast_layer){
+    max_value <- global(rast_layer, fun = "max", na.rm = TRUE)[1,1]
+    min_value <- global(rast_layer, fun = "min", na.rm = TRUE)[1,1]
+    
+    if(is.na(max_value) || max_value == min_value) return(rast_layer * 0) 
+    (rast_layer - min_value) / (max_value - min_value)
+  })
+  
+  normalized_stack <- rast(normalized_layers)
+  mean_eval <- mean(normalized_stack, na.rm = TRUE)
+  
+  final_max <- global(mean_eval, fun = "max", na.rm = TRUE)[1,1]
+  final_min <- global(mean_eval, fun = "min", na.rm = TRUE)[1,1]
+  
+  if(!is.na(final_max) && final_max != final_min) {
+    mean_eval <- (mean_eval - final_min) / (final_max - final_min)
+  }
+  
+  if(!is.null(active_mask)) mean_eval <- mask(mean_eval, active_mask)
+  
+  out_path_mean <- file.path(out_norm_direct, paste0(ex,"_normalized_mean_01_", out_end, "touches.tif"))
+  writeRaster(mean_eval, out_path_mean, overwrite = TRUE)
+
+}
+```
+
+
+
+

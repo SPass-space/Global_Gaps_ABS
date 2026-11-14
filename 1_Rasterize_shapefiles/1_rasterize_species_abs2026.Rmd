@@ -1,0 +1,564 @@
+---
+title: "rasterize_species"
+output: html_document
+date: "2025-05-16"
+---
+
+
+--------------------------------------------------------------------------------------------------------
+This script looks up each unique species that is being tracked and finds its corresponding range map and rasterizes it by family and expression (e.g. marine, aerial, terrestrial)
+---------------------------------------------------------------------------------------------------------
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(move2)
+library(httr)
+library(jsonlite)
+library(sf)
+library(terra)
+library(lubridate)
+library(tidyr)
+library(purrr)
+library(rnaturalearth)
+```
+
+
+
+```{r}
+# ------------------------------------------------------------------
+#Rangemap Shapefile locations
+# ------------------------------------------------------------------
+
+#Point to folders where shapefiles exist
+shape_source_dir <- list(
+  inatralist = "inaturalist_rangemaps",
+  iucn = "iucn_rangemaps",
+  birdlife = "bird_life")
+
+
+#load in csv with unique species with range maps
+sps_rngs_df <- read.csv("combined_species_df_1957.csv" )
+
+
+```
+
+
+
+```{r}
+# ------------------------------------------------------------------
+#Prepare data with correct tags for analysis
+# ------------------------------------------------------------------
+
+# List of bat families for inclusion or exclusion
+bat_families <- c("Pteropodidae", "Phyllostomidae", "Vespertilionidae", 
+                  "Molossidae", "Emballonuridae", "Megadermatidae",
+                  "Rhinolophidae", "Myzopodidae", "Noctilionidae")
+
+# Wetland birds that qualify as marine 
+marine_wetland_species <- c(
+  "Clangula hyemalis",
+  "Melanitta fusca",
+  "Melanitta nigra",
+  "Melanitta perspicillata"
+)
+
+shape_source_dir <- list(
+  inaturalist = "range_maps/inaturalist_rangemaps/",
+  iucn = "range_maps/iucn_rangemaps/",
+  birdlife = "range_maps/bird_life/"
+)
+
+
+#clean up dataframe for processing
+sps_rngs_df2 <- sps_rngs_df %>%
+  # Replace NAs with FALSE for all boolean columns
+  mutate(
+    across(c(marine, freshwater, aerial, aquatic, terrestria), ~ ifelse(is.na(.), FALSE, .)),
+    across(c(marine, freshwater, aerial, aquatic, terrestria), as.logical),
+    range_map = tolower(range_map)
+  ) %>%
+
+  # Tag bats as aerial and terrestrial 
+  mutate(
+    aerial = ifelse(family %in% bat_families, TRUE, aerial),
+    terrestria = ifelse(family %in% bat_families, TRUE, terrestria)
+  ) %>%
+  mutate(
+      # MARINE: classify birds where Primary_Lifestyle_AVONET is Marine or Coastal
+    is_marine = (marine == TRUE & class != "Aves"),
+    is_marine = ifelse(
+      class == "Aves" & Habitat_AVONET %in% c("Marine", "Coastal"),
+      TRUE, is_marine
+    ),
+    # MARINE: specify wetland sea duck species as marine
+    is_marine = ifelse(
+      sci_name %in% marine_wetland_species,
+      TRUE, is_marine
+    ),
+    # TERRESTRIAL: terrestrial AND (not aerial OR is a bat), not penguins
+    # The '| family %in% bat_families' is the exception that allows bats to be both!
+    is_terrestrial = (terrestria == TRUE & (aerial == FALSE | family %in% bat_families) & family != "Spheniscidae"),
+    # AERIAL
+    is_aerial = (aerial == TRUE),
+    # FRESHWATER
+    is_freshwater = (freshwater == TRUE)
+  ) %>%
+  mutate(
+    family = case_match(
+      family,
+      c("Acanthurinae", "Nasinae") ~ "Acanthuridae",
+      "Albulinae" ~ "Albulidae",
+      c("Ariinae", "Bagreinae") ~ "Ariidae",
+      c("Caranginae", "Naucratinae", "Trachinotinae") ~ "Carangidae",
+      "Catostominae" ~ "Catostomidae",
+      c("Hippoglossinae", "Pleuronectinae") ~ "Pleuronectidae",
+      "Holocentrinae" ~ "Holocentridae",
+      "Ophiodontinae" ~ "Hexagrammidae",
+      c("Pteroinae", "Scorpaeninae", "Sebastinae") ~ "Scorpaenidae",
+      "Zoarcinae" ~ "Zoarcidae",
+      .default = family # If not in the list, keep the original name
+    )
+  )
+
+
+
+# ------------------------------------------------------------------
+# Build the expression_df 
+# ------------------------------------------------------------------
+
+
+# File lookup tables for iucn and inat rangemaps that has file paths
+iucn_lookup <- read.csv("iucn_avail_maps_2026full.csv")%>%
+  select(sci_name, filename) %>%
+  mutate(range_map = "iucn",
+    sci_name = str_to_sentence(trimws(sci_name)) 
+  ) %>%
+  distinct(sci_name, .keep_all = TRUE)
+  
+inat_lookup <- read.csv("inat_avl_mps.csv") %>%
+  rename(sci_name = name) %>%
+  select(sci_name, filename)%>%
+  mutate(range_map = "inaturalist") %>%
+  distinct(sci_name, .keep_all = TRUE)
+
+
+# Join species data with rangemap file paths
+sps_rngs_df2 <- left_join(sps_rngs_df2, iucn_lookup, by = c("sci_name", "range_map"))
+
+
+#clean up the dataframe
+sps_ranges_df3 <- sps_rngs_df2 %>%
+  left_join(inat_lookup, by = c("sci_name", "range_map")) %>%
+  distinct(sci_name, .keep_all = TRUE) %>%
+  mutate(filename = coalesce(filename.x, filename.y)) %>%
+  select(-filename.x, -filename.y) %>%
+  mutate(
+    full_path = case_when(
+      range_map == "iucn"        ~ paste0(shape_source_dir[2], filename),
+      range_map == "inaturalist" ~ paste0(shape_source_dir[1], filename),
+      range_map == "bird life"   ~ paste0(shape_source_dir[3], "BOTW_2024_2.gpkg")
+    )
+  )
+
+# Pivot the analysis tags into long format
+expression_df <- sps_ranges_df3 %>%
+  select(sci_name, original_sci, common_name, family, class, full_path, range_map,
+         is_marine, is_terrestrial, is_aerial, is_freshwater, Habitat_AVONET, Primary_Lifestyle_AVONET) %>%
+   mutate(
+    full_path = case_when(
+      #manual corrections for certain range maps
+      tolower(sci_name) == "anaxyrus boreas" ~ "iNaturalist_geomodel_Amphibia.gpkg",
+      tolower(sci_name) == "pteropus melanotus" ~ "iNaturalist_geomodel_Mammalia.gpkg",
+      TRUE ~ full_path
+    ),
+    range_map = case_when(
+      tolower(sci_name) == "anaxyrus boreas" ~ "inaturalist",
+      tolower(sci_name) == "pteropus melanotus" ~ "inaturalist",
+      TRUE ~ range_map
+    ))%>%
+  pivot_longer(
+    cols = starts_with("is_"),
+    names_to = "analysis",
+    values_to = "included"
+  ) %>%
+  filter(included == TRUE) %>%
+  select(-included) %>%
+  # Clean up analysis names for file naming
+  mutate(analysis = str_remove(analysis, "^is_")) %>%
+  distinct(sci_name, analysis, .keep_all = TRUE)
+
+
+```
+
+
+Rasterization process with touches = TRUE. This section writes out rasters for each family within each type of range map and analysis.
+
+```{r}
+#specify out directories for mollweide for statistic processing and esri4326 for visualizations
+
+out_directory <- "raster_maps/mollweide"
+out_directory_4326 <- "raster_maps/esri_4326"
+
+#get the full paths for each shapefile
+shapefile_paths <- unique(expression_df$full_path)
+
+# 1 degree raster template for analyses with 1 degree resolution
+temp_raster_1deg <- rast(nlyrs = 1, xmin = -180, xmax = 180, ymin = -90, ymax = 90,
+                         crs = "EPSG:4326", resolution = c(1, 1), vals = NA)
+
+# 5 degree raster template for analyses with 5 degree resolution
+temp_raster_5deg <- rast(nlyrs = 1, xmin = -180, xmax = 180, ymin = -90, ymax = 90,
+                         crs = "EPSG:4326", resolution = c(5, 5), vals = NA)
+#specify mollweide crs
+crs_moll <- st_crs("ESRI:54009")$wkt
+
+#~equivalent 1 and 5 degree resolutions
+temp_raster_1deg_moll <- project(temp_raster_1deg, crs_moll, res = 100000)
+temp_raster_5deg_moll <- project(temp_raster_5deg, crs_moll, res = 500000)
+
+#initialize empty lists
+species_processed <- list()
+analysis_processed <- list()
+sensitivity_results <- list()
+
+
+
+for (shp_path in shapefile_paths) {
+  file_prefix <- tools::file_path_sans_ext(basename(shp_path))
+  
+  # Check if  need to process ANY groups from this shapefile
+  group_keys <- expression_df %>% 
+    filter(full_path == shp_path) %>% 
+    distinct(family, analysis, range_map)
+  
+  if(nrow(group_keys) == 0) next
+  
+  # Check to see if file already exists
+  groups_to_process <- c()
+  for (group in seq_len(nrow(group_keys))) {
+    fam <- group_keys$family[group]
+    anlys <- group_keys$analysis[group]
+    rng_mp <- gsub(" ", "", group_keys$range_map[group])
+    
+    out_name <- paste0(fam, "_", anlys, "_", rng_mp, "_", file_prefix, ".touches.tif")
+    out_path <- file.path(out_directory, out_name)
+    
+    # For aerial, also check the 1 res file
+    if (anlys == "aerial") {
+      out_path_a1 <- sub("\\.touches\\.tif$", "_1res.touches.tif", out_path)
+      if (!file.exists(out_path) | !file.exists(out_path_a1)) {
+        groups_to_process <- c(groups_to_process, group)
+      }
+    } else {
+      if (!file.exists(out_path)) {
+        groups_to_process <- c(groups_to_process, group)
+      }
+    }
+  }
+  
+  # Skip loading shapefile if all groups already exist
+  if (length(groups_to_process) == 0) {
+    cat("Skipping shapefile (all outputs exist):", basename(shp_path), "\n")
+    next
+  }
+ 
+  cat("Opening shapefile:", basename(shp_path), "\n")
+
+  # Read shapefile for bird species
+  if (basename(shp_path) == "BOTW_2024_2.gpkg") {
+    shp <- st_read("bird_life.shp", quiet=TRUE) %>%
+      rename(sci_name = sci_nam) %>% filter(presenc == 1)
+    range_map <- "bird life"
+    cat("Source: BirdLife (filtered to presence = 1)\n")
+    
+  } else if (grepl("iucn", shp_path)) {
+    shp <- st_read(shp_path, quiet = TRUE)
+    names(shp) <- tolower(names(shp))
+    shp <- shp %>% filter(presence %in% c(1, 2, 3, 4, 6))
+    range_map <- "iucn"
+    cat("Source: IUCN (filtered to presence = 1,2,3,4,6)\n")
+    
+  } else if (grepl("inaturalist", shp_path)) {
+    shp <- st_read(shp_path, quiet = TRUE)
+    names(shp) <- tolower(names(shp))
+    shp <- shp %>% rename(sci_name = name)
+    range_map <- "inaturalist"
+    cat("Source: iNaturalist\n")
+    
+  } else {
+    cat("Skipping: unknown source type\n")
+    next
+  }
+  
+  if (is.null(shp)) {
+    cat("Shapefile is NULL, skipping\n")
+    next
+  }
+  
+  cat("Total features loaded:", nrow(shp), "\n")
+  cat("Groups to process:", length(groups_to_process), "of", nrow(group_keys), "(skipping existing)\n")
+  
+  for (group in groups_to_process) {
+    fam <- group_keys$family[group]
+    anlys <- group_keys$analysis[group]
+
+    rng_mp <- gsub(" ", "", group_keys$range_map[group])
+    
+    out_name <- paste0(fam, "_", anlys, "_", rng_mp, "_", file_prefix, ".touches.tif")
+    out_path <- file.path(out_directory, out_name)
+    
+    out_name_4326 <- paste0(fam, "_", anlys, "_", rng_mp, "_", file_prefix, ".4326.touches.tif")
+    out_path_4326 <- file.path(out_directory_4326, out_name_4326)
+    
+    out_path_a1 <- sub("\\.touches\\.tif$", "_1res.touches.tif", out_path)
+    out_path_4326_a1 <- sub("\\.4326\\.touches\\.tif$", "_1res.4326.touches.tif", out_path_4326)
+    
+    # Double-check file existence (in case of aerial where we check both 1 and 5 degree resolution)
+    if (anlys != "aerial" && file.exists(out_path)) {
+      cat("  Skipping (exists):", basename(out_path), "\n")
+      next
+    }
+    if (anlys == "aerial" && file.exists(out_path) && file.exists(out_path_a1)) {
+      cat("  Skipping (both exist):", basename(out_path), "\n")
+      next
+    }
+    
+    cat("Processing:", fam, "|", anlys, "|", rng_mp, "\n")
+    cat("Output:", basename(out_path), "\n")
+    
+    species_in_group <- expression_df %>%
+      filter(family == fam, analysis == anlys, full_path == shp_path) %>%
+      pull(sci_name) %>% unique() %>% tolower() 
+    
+    cat("Species in group:", length(species_in_group), "\n")
+    
+    shp_match <- shp %>% mutate(match_name = tolower(sci_name)) %>% filter(match_name %in% species_in_group) 
+    
+    if (nrow(shp_match) == 0) {
+      cat("No species matched in shapefile, skipping\n")
+      next
+    }
+    
+    cat("Matched features:", nrow(shp_match), "\n")
+    
+    shp_match_reg <- st_transform(shp_match, "EPSG:4326")
+    shp_match <- st_transform(shp_match, crs_moll)
+
+    moll_rasters_1deg <- list()
+    reg_rasters_1deg  <- list()
+    moll_rasters_5deg <- list()
+    reg_rasters_5deg  <- list()
+    
+    sp_count <- 0
+    for (sp in species_in_group) {
+      sp_poly_moll <- shp_match %>% filter(match_name == sp)
+      sp_poly_4326 <- shp_match_reg %>% filter(match_name == sp)
+      
+      if (nrow(sp_poly_moll) > 0) {
+        sp_count <- sp_count + 1
+        cat("  [", sp_count, "/", length(species_in_group), "] Rasterizing:", sp, "\n")
+        
+        # Always rasterize 1-degree
+        r_moll_1 <- rasterize(vect(sp_poly_moll), temp_raster_1deg_moll, touches = TRUE)
+        r_reg_1  <- rasterize(vect(sp_poly_4326), temp_raster_1deg, touches = TRUE)
+        if (!is.na(global(r_moll_1, "max", na.rm = TRUE)[1, 1])) moll_rasters_1deg[[length(moll_rasters_1deg) + 1]] <- r_moll_1
+        if (!is.na(global(r_reg_1, "max", na.rm = TRUE)[1, 1])) reg_rasters_1deg[[length(reg_rasters_1deg) + 1]] <- r_reg_1
+        
+        # IF AERIAL, also rasterize 5-degree
+        if (anlys == "aerial") {
+          r_moll_5 <- rasterize(vect(sp_poly_moll), temp_raster_5deg_moll, touches = TRUE)
+          r_reg_5  <- rasterize(vect(sp_poly_4326), temp_raster_5deg, touches = TRUE)
+          if (!is.na(global(r_moll_5, "max", na.rm = TRUE)[1, 1])) moll_rasters_5deg[[length(moll_rasters_5deg) + 1]] <- r_moll_5
+          if (!is.na(global(r_reg_5, "max", na.rm = TRUE)[1, 1])) reg_rasters_5deg[[length(reg_rasters_5deg) + 1]] <- r_reg_5
+        }
+      } else {
+        cat("  [", sp_count + 1, "/", length(species_in_group), "] NOT FOUND:", sp, "\n")
+      }
+    }
+
+    # SUM AND SAVE
+    cat("\nSaving outputs...\n")
+    if (anlys != "aerial") {
+      if (length(moll_rasters_1deg) > 0) {
+        writeRaster(sum(rast(moll_rasters_1deg), na.rm=T), out_path, overwrite=TRUE)
+        cat("  ✓ Saved:", basename(out_path), "\n")
+      }
+      if (length(reg_rasters_1deg) > 0) {
+        writeRaster(sum(rast(reg_rasters_1deg), na.rm=T), out_path_4326, overwrite=TRUE)
+        cat("  ✓ Saved:", basename(out_path_4326), "\n")
+      }
+    } else {
+      # Aerial 5-degree
+      if (length(moll_rasters_5deg) > 0) {
+        writeRaster(sum(rast(moll_rasters_5deg), na.rm=T), out_path, overwrite=TRUE)
+        cat("  ✓ Saved (5-deg):", basename(out_path), "\n")
+      }
+      if (length(reg_rasters_5deg) > 0) {
+        writeRaster(sum(rast(reg_rasters_5deg), na.rm=T), out_path_4326, overwrite=TRUE)
+        cat("  ✓ Saved (5-deg):", basename(out_path_4326), "\n")
+      }
+      # Aerial 1-degree
+      if (length(moll_rasters_1deg) > 0) {
+        writeRaster(sum(rast(moll_rasters_1deg), na.rm=T), out_path_a1, overwrite=TRUE)
+        cat("  ✓ Saved (1-deg):", basename(out_path_a1), "\n")
+      }
+      if (length(reg_rasters_1deg) > 0) {
+        writeRaster(sum(rast(reg_rasters_1deg), na.rm=T), out_path_4326_a1, overwrite=TRUE)
+        cat("  ✓ Saved (1-deg):", basename(out_path_4326_a1), "\n")
+      }
+    }
+    
+    cat("Completed:", fam, "- rasterized", sp_count, "of", length(species_in_group), "species\n")
+  }
+  #remove shape to preserve memory
+  cat("\nCleaning up memory for:", basename(shp_path), "\n")
+  rm(shp); gc()
+}
+
+cat("\n\n RASTERIZATION STEP 1 PROCESS COMPLETE \n")
+
+
+# write out a sensitivity report for rasterization process
+
+sensitivity_df <- bind_rows(sensitivity_results)
+write.csv(sensitivity_df, "Main_Loop_Sensitivity_Report.csv")
+
+cat("\nSENSITIVITY SUMMARY: \n")
+print(
+  sensitivity_df %>%
+    group_by(analysis) %>%
+    summarise(
+      Total_Species = n(),
+      Missing_from_Shapefile = sum(!found_in_shapefile),
+      Dropped_1deg = sum(found_in_shapefile & !rasterized_4326_1deg, na.rm = TRUE),
+      Dropped_5deg = sum(found_in_shapefile & !rasterized_4326_5deg, na.rm = TRUE)
+    )
+)
+```
+
+
+The section get all tiffs that have the same family and expressions and sum them into one (combines matching familiy rasters from IUCN and inaturalist and Bird Life)
+
+```{r}
+
+in_dirs <- c(
+  moll = "raster_maps/mollweide",
+  epsg = "raster_maps/esri_4326"
+)
+
+out_dirs <- c(
+  moll = "family_maps/mollweide",
+  epsg = "family_maps/esri_4326"
+)
+
+
+# Families that have range maps extending into Antarctica that should have Antarctica not included
+families_no_ant <- c("Bovidae", "Canidae", "Felidae", "Equidae")
+
+# Base land mask without Antarctica
+world <- ne_countries(scale = "large", returnclass = "sf")
+land_no_ant_sf <- world %>% filter(admin != "Antarctica")
+
+
+#loops through Mollweide and esri 4326
+for (proj in c("moll", "epsg")) {
+
+  cat("PROCESSING PROJECTION:", toupper(proj), "\n")
+  
+  in_dir <- in_dirs[proj]
+  out_dir <- out_dirs[proj]
+  
+  # Get file list for this projection
+  family_rasters_list <- list.files(in_dir, pattern = "\\.tif$", full.names = TRUE)
+  if (length(family_rasters_list) == 0) {
+    cat("No TIF files found in", in_dir, "\n")
+    next
+  }
+  
+  # Build metadata dataframe from file name
+  raster_group <- data.frame(
+    full_path = family_rasters_list,
+    base_name = basename(family_rasters_list),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(family_analysis = str_extract(base_name, "^[^_]+_[^_]+")) %>%
+    mutate(og_family = str_extract(family_analysis, "^[^_]+")) %>%
+    mutate(analysis_type = str_extract(family_analysis, "(?<=_)[^_]+")) %>%
+    mutate(is_1res = str_detect(base_name, "_1res")) %>%
+    mutate(group_id = if_else(is_1res, paste0(family_analysis, "_1res"), family_analysis))
+  
+  # Get the unique groups we need to sum
+  unique_groups <- unique(raster_group$group_id)
+  
+  
+  cat("Total groups found:", length(unique_groups), "\n")
+  
+  #Check to see what groups have already been processed
+  groups_to_process <- c()
+  groups_skipped <- 0
+  
+  for (grp in unique_groups) {
+    out_path <- file.path(out_dir, paste0(grp, ".tif"))
+    if (file.exists(out_path)) {
+      groups_skipped <- groups_skipped + 1
+    } else {
+      groups_to_process <- c(groups_to_process, grp)
+    }
+  }
+  
+  cat("Groups to process:", length(groups_to_process), "\n")
+  cat("Groups skipped (already exist):", groups_skipped, "\n\n")
+  
+  if (length(groups_to_process) == 0) {
+    cat("All outputs exist for", toupper(proj), "- skipping.\n")
+    next
+  }
+  
+  # Prepare the specific mask for this projection 
+  target_crs <- crs(rast(family_rasters_list[1]))
+  land_no_ant <- project(vect(land_no_ant_sf), target_crs)
+  
+
+  #process family group
+  processed_count <- 0
+  
+  for (grp in groups_to_process) {
+    processed_count <- processed_count + 1
+    cat("[", processed_count, "/", length(groups_to_process), "] Processing:", grp, "\n")
+    
+    grp_df <- raster_group %>% filter(group_id == grp)
+    current_family <- unique(grp_df$og_family)
+    current_analysis <- unique(grp_df$analysis_type)
+    
+    #list files being included
+    cat("Source files:", nrow(grp_df), "\n")
+    
+    # Load and stack all rasters for this specific family/analysis combo
+    family_rasters <- lapply(grp_df$full_path, rast)
+    raster_stack <- rast(family_rasters)
+    print(raster_stack)
+    
+    # Sum across layers
+    summed <- app(raster_stack, fun = "sum", na.rm = TRUE)
+    
+    # Apply terrestrial mask (NO Antarctica) if applicable
+    if (current_analysis == "terrestrial" && current_family %in% families_no_ant) {
+      cat("Applying Antarctica mask\n")
+      summed <- mask(summed, land_no_ant)
+    } 
+    
+
+    out_path <- file.path(out_dir, paste0(grp, ".tif"))
+    writeRaster(summed, out_path, overwrite = TRUE)
+    cat("Saved:", basename(out_path), "\n")
+  }
+  
+  cat("\nCompleted", toupper(proj), ":", processed_count, "groups processed.\n")
+}
+
+
+
+```
+

@@ -1,0 +1,1122 @@
+---
+title: "patchwork_plots"
+output: html_document
+date: "2026-06-02"
+---
+
+
+```{r}
+library(terra)
+library(sf)
+library(ggplot2)
+library(ggnewscale)
+library(patchwork)
+library(rnaturalearth)
+library(rphylopic)
+library(stringr)
+library(readr)
+library(janitor)
+library(png)
+library(ggimage)
+library(tools)
+```
+
+
+Fig.2 Global Gaps, species richness normalized, and globals overlaps by Land, Ocean, and Air
+
+```{r}
+
+
+land_mask <- st_transform(ne_download(scale = "medium", type = "land", category = "physical", returnclass = "sf"), 4326)
+ocean_mask <- st_transform(ne_download(scale = "medium", type = "ocean", category = "physical", returnclass = "sf"), 4326)
+
+out_dir <- "plots/patchwork_grids"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# --- OLDSPOT PATHS ---
+path_cold_land <- "GHCN_terr/coldspots/ws_4326_final_coldspot2.tif"
+path_cold_sea  <- "Argos/final_coldspot_raster_1res_4326.tif"
+path_cold_air  <- "radio/rs_coldspot_res5_80presist_4326.tif" 
+
+# --- SPECIES RICHNESS NORMALIZED PATHS ---
+#path_srn_land <- "terrestrial_no_bats_species_richness_normalized_4326.tif"
+path_srn_land <- "terrestrial_species_richness_normalized_4326touches.tif"
+path_srn_sea  <- "marine_species_richness_normalized_4326touches.tif"
+path_srn_air  <- "aerial_species_richness_normalized_4326touches.tif"
+
+
+my_richness_colors <- c(
+  "#91c789", 
+  "#ffffbf",
+  "#ffd490", 
+  "#fdae61",
+  "#c51b7d", 
+  "#4d004b"  
+)
+
+
+base_theme <- function() {
+  theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold", margin = margin(b = 10)),
+      axis.title.y.left = element_text(angle = 0, vjust = 0.5, hjust = 1, size = 16, face = "bold", margin = margin(r = 15)),
+      panel.border = element_rect(color = "#3b3b3b", fill = NA, linewidth = 1),
+      legend.title = element_text(size = 10),
+      legend.key.height = unit(0.75, "cm"),
+      legend.key.width = unit(0.6, "cm"),
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 5) 
+    )
+}
+
+get_mask_config <- function(env) {
+  #Custom linewidths
+  if (env == "land") {
+    return(list(top_sf = ocean_mask, top_fill = "lightgrey", top_color = "#3b3b3b", top_alpha = 1, top_linewidth = 0.05))
+  } else if (env == "sea") {
+    return(list(top_sf = land_mask, top_fill = "lightgrey", top_color = "#3b3b3b", top_alpha = 1, top_linewidth = 0.05))
+  } else { 
+    return(list(top_sf = land_mask, top_fill = NA, top_color = "#3b3b3b", top_alpha = 1, top_linewidth = 0.2))
+  }
+}
+
+#  COLDSPOT PLOTTER
+plot_grid_coldspot <- function(cold_path, env, col_title = NULL, row_title = NULL, show_legend = TRUE) {
+  cold_df <- as.data.frame(rast(cold_path), xy = TRUE, na.rm = TRUE)
+  colnames(cold_df)[3] <- "value"
+  cfg <- get_mask_config(env)
+  
+  p <- ggplot() +
+    geom_sf(data = land_mask, fill = "white", color = NA) +
+    geom_tile(data = cold_df, aes(x = x, y = y, fill = factor(value))) +
+    scale_fill_manual(name = "Coldspot", values = c("1" = "#288CBE"), na.translate = FALSE, labels = "") +
+    geom_sf(data = cfg$top_sf, fill = cfg$top_fill, color = cfg$top_color, alpha = cfg$top_alpha, linewidth = cfg$top_linewidth) +
+    coord_sf(ylim = c(-85, 85), expand = FALSE) + 
+    labs(title = col_title, y = row_title) + 
+    base_theme()
+  
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  return(p)
+}
+
+#BIODIVERSITY PLOTTER
+plot_grid_bio <- function(bio_path, env, row_title = NULL, leg_title = "Value", limits = NULL, show_legend = TRUE) {
+  bio_df <- as.data.frame(rast(bio_path), xy = TRUE, na.rm = TRUE)
+  colnames(bio_df)[3] <- "value"
+  cfg <- get_mask_config(env)
+  
+  p <- ggplot() +
+    geom_tile(data = bio_df, aes(x = x, y = y, fill = value)) +
+    scale_fill_gradientn(name = leg_title, colors = my_richness_colors, limits = limits, na.value = NA) +
+    geom_sf(data = cfg$top_sf, fill = cfg$top_fill, color = cfg$top_color, alpha = cfg$top_alpha, linewidth = cfg$top_linewidth) +
+    coord_sf(ylim = c(-85, 85), expand = FALSE) + 
+    labs(y = row_title) + 
+    base_theme()
+  
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  return(p)
+}
+
+# OVERLAP PLOTTER
+plot_grid_overlap <- function(bio_path, cold_path, env, row_title = NULL, leg_title = "Value", limits = NULL, show_legend = TRUE) {
+  cold_r <- rast(cold_path)
+  bio_r <- resample(rast(bio_path), cold_r, method = "near")
+  
+  overlap_r <- bio_r * cold_r
+  overlap_r[overlap_r == 0] <- NA 
+  
+  cold_df <- as.data.frame(cold_r, xy = TRUE, na.rm = TRUE)
+  colnames(cold_df)[3] <- "value"
+  ov_df <- as.data.frame(overlap_r, xy = TRUE, na.rm = TRUE)
+  colnames(ov_df)[3] <- "value"
+  
+  min_val <- min(ov_df$value, na.rm = TRUE)
+  custom_breaks <- unique(c(min_val, 0.25, 0.50, 0.75, 1.00))
+  
+  cfg <- get_mask_config(env)
+  
+  p <- ggplot() +
+    geom_sf(data = land_mask, fill = "white", color = NA) +
+    geom_tile(data = cold_df, aes(x = x, y = y, fill = factor(value))) +
+    scale_fill_manual(
+      name = "Coldspot with\nNo Overlap", 
+      values = c("1" = "#288CBE"), 
+      na.translate = FALSE, 
+      labels = "", 
+      guide = guide_legend(order = 1)
+    ) +
+    new_scale_fill() +
+    geom_tile(data = ov_df, aes(x = x, y = y, fill = value)) +
+  
+    scale_fill_gradientn(
+      name = leg_title, 
+      colors = my_richness_colors, 
+      limits = c(0, 1),           
+      breaks = custom_breaks,     
+      labels = function(x) sprintf("%.2f", x), 
+      na.value = NA,
+      guide = guide_colorbar(order = 2)
+    ) +
+    geom_sf(data = cfg$top_sf, fill = cfg$top_fill, color = cfg$top_color, alpha = cfg$top_alpha, linewidth = cfg$top_linewidth) +
+    coord_sf(ylim = c(-85, 85), expand = FALSE) + 
+    labs(y = row_title) + 
+    base_theme()
+  
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  return(p)
+}
+
+
+
+p_c_land <- plot_grid_coldspot(path_cold_land, "land", col_title = "LAND", row_title = "Global Gaps", show_legend = FALSE)
+p_c_sea  <- plot_grid_coldspot(path_cold_sea,  "sea",  col_title = "OCEAN", show_legend = FALSE)
+p_c_air  <- plot_grid_coldspot(path_cold_air,  "air",  col_title = "AIR", show_legend = TRUE)
+
+l_sr <- "No. species"
+
+
+
+# --- SPECIES RICHNESS NORMALIZED ---
+l_srn <- "No. of species\n(normalized)"
+p_srn_land <- plot_grid_bio(path_srn_land, "land", row_title = "Species Richness\nNormalized", leg_title = l_srn, limits = c(0,1), show_legend = FALSE)
+p_srn_sea  <- plot_grid_bio(path_srn_sea,  "sea",  leg_title = l_srn, limits = c(0,1), show_legend = FALSE)
+p_srn_air  <- plot_grid_bio(path_srn_air,  "air",  leg_title = l_srn, limits = c(0,1), show_legend = TRUE)
+
+p_ov3_land <- plot_grid_overlap(path_srn_land, path_cold_land, "land", row_title = "Overlap", leg_title = l_srn, limits = c(0,1), show_legend = FALSE)
+p_ov3_sea  <- plot_grid_overlap(path_srn_sea,  path_cold_sea,  "sea",  leg_title = l_srn, limits = c(0,1), show_legend = FALSE)
+p_ov3_air  <- plot_grid_overlap(path_srn_air,  path_cold_air,  "air",  leg_title = l_srn, limits = c(0,1), show_legend = TRUE)
+
+grid_opt3 <- (p_c_land | p_c_sea | p_c_air) / (p_srn_land | p_srn_sea | p_srn_air) / (p_ov3_land | p_ov3_sea | p_ov3_air)
+ggsave(file.path(out_dir, "Species_Richness_Normalized_all_1res_touches_1957.png"), grid_opt3, width = 16, height = 9, dpi = 500)
+
+
+```
+
+
+
+
+Fig 3 top overlap plots
+
+
+```{r}
+
+
+land_mask <- ne_download(scale = "medium", type = "land", category = "physical", returnclass = "sf")
+ocean_mask <- ne_download(scale = "medium", type = "ocean", category = "physical", returnclass = "sf")
+
+out_dir <- "plots/patchwork_grids"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# --- COLDSPOT PATHS ---
+path_cold_land <- "GHCN_terr/coldspots/ws_4326_final_coldspot2.tif"
+path_cold_sea  <- "Argos/final_coldspot_raster_1res_4326.tif"
+path_cold_air  <- "radio/rs_coldspot_res5_80presist_4326.tif" 
+
+# --- TOP FAMILY OVERLAP RASTER PATHS ---
+# Land: Bovidae & Felidae
+path_land_1 <- "GHCN_terr/GHCN_overlap/esri_4326/Bovidae_terrestrial_GHCN_overlap_48.tif"
+path_land_2 <- "GHCN_terr/GHCN_overlap/esri_4326/Felidae_terrestrial_GHCN_overlap_22.tif"
+
+# Sea: Laridae & Procellariidae
+path_sea_1  <- "Argos/argo_overlap/esri_4326/Laridae_marine_argo_overlap_60.tif"
+path_sea_2  <- "Argos/argo_overlap/esri_4326/Procellariidae_marine_argo_overlap_78.tif"
+
+# Air: Laridae & Accipitridae
+path_air_1  <- "radio/esri_4326/Laridae_aerial_radiooverlap_72.tif"
+path_air_2  <- "radio/esri_4326/Accipitridae_aerial_radiooverlap_92.tif"
+
+#  PHYLOPIC FETCHER
+
+get_phylopic_img <- function(family_name) {
+  uuid_dict <- list(
+    "Accipitridae"    = "a92be6af-cb30-4d55-a3b0-cc3016be6c6c",
+    "Anatidae"        = "97f833ff-fcd8-4113-8948-721c75372462",
+    "Balaenopteridae" = "fd8d3e5e-24a0-4aa2-9211-987ff86007dd",
+    "Bovidae"         = "dbf2f035-6c04-4c4f-a9aa-f01a1e35ea9c",
+    "Canidae"         = "4b31c74e-7fbb-4ec9-a96e-f5b281c2b9d4",
+    "Carcharhinidae"  = "49039ecb-e03b-4cdc-9c9a-0393bf0ffe99",
+    "Cervidae"        = "4b474bdd-24e0-428d-b1f0-6d221ffc6367",
+    "Charadriidae"    = "fcc3ea71-17d5-44cc-8b52-dea48a83c943",
+    "Delphinidae"     = "388e792c-f8fd-4bd8-ad38-e251b5244ac0",
+    "Equidae"         = "f7d817d0-d733-493d-bd4a-3f178e0760a8",
+    "Felidae"         = "3f8eff77-2868-4121-8d7d-a55ebdd49e04",
+    "Hydrobatidae"    = "d6668ea1-5914-4b05-abe9-fbc7562f83fc",
+    "Labridae"        = "b25eec2b-7397-49ea-a42b-4ffe6250870b",
+    "Laridae"         = "23eecd7f-89e1-45c5-9d8a-7c7f373d3af7",
+    "Mustelidae"      = "5e13bb38-4c9f-4c7a-9c5c-0597fd33e4ab",
+    "Phocidae"        = "10d73995-c697-405e-8ffd-fc9900d3a3cb",
+    "Procellariidae"  = "a8ecc1e9-f339-4d85-84c3-aa2fff47b2c1",
+    "Scolopacidae"    = "145b43ea-a9d7-4a98-8764-2ebefd6cefe8",
+    "Stercorariidae"  = "bc1b9b9b-0f3e-41b4-b342-cf669b69afa1",
+    "Oceanitidae"     = "Oceanites oceanicus"
+  )
+  
+  if (family_name %in% names(uuid_dict)) {
+    uuid <- uuid_dict[[family_name]]
+  } else {
+    uuid <- tryCatch({ get_uuid(name = family_name, n = 1) }, error = function(e) return(NULL))
+  }
+  
+  if (is.null(uuid) || is.na(uuid)) return(NULL)
+  
+  img <- tryCatch({ get_phylopic(uuid = uuid) }, error = function(e) return(NULL))
+  return(img)
+}
+
+
+plot_family_overlap <- function(overlap_path, coldspot_path, env, analysis_label, height_option, col_header = NULL) {
+  
+  coldspots <- rast(coldspot_path)
+  ov_raster <- rast(overlap_path)
+
+  
+  if (env == "land") {
+    mask_sf <- st_transform(ocean_mask, crs(coldspots))
+    mask_fill <- "lightgrey"; mask_color <- "#3b3b3b"; lw <- .05
+  } else if (env == "sea") {
+    mask_sf <- st_transform(land_mask, crs(coldspots))
+    mask_fill <- "lightgrey"; mask_color <- "#3b3b3b" ; lw <- .05
+  } else {
+    mask_sf <- st_transform(land_mask, crs(coldspots))
+    mask_fill <- NA; mask_color <- "#3b3b3b"; lw <- .2
+  }
+  
+  coldspots_aligned <- resample(coldspots, ov_raster, method = "near")
+  coldspots_df <- as.data.frame(coldspots_aligned, xy = TRUE, na.rm = TRUE)
+  colnames(coldspots_df)[3] <- "value"
+  
+  sps_df <- as.data.frame(ov_raster, xy = TRUE, na.rm = TRUE)
+  colnames(sps_df)[3] <- "value"
+  
+  base_title <- sub("\\.tif$", "", basename(overlap_path))
+  parts <- str_split(base_title, "_")[[1]]
+  family_name <- str_to_title(parts[1])
+  n_species <- parse_number(base_title)
+  n_species_char <- paste0("(n=", n_species, ")")
+  plot_title <- paste0(family_name, " ", n_species_char)
+  
+  plot_xlim <- c(-180, 180)
+  plot_ylim <- c(-85, 85)
+  x_span <- diff(plot_xlim)
+  y_span <- diff(plot_ylim)
+  
+  icon_xpos <- plot_xlim[2] - 0.08 * x_span
+  ypos      <- plot_ylim[1] + 0.16 * y_span
+  text_y    <- ypos - 0.09 * y_span
+  
+  phylo_img <- get_phylopic_img(family_name)
+  
+  p <- ggplot() +
+    geom_sf(data = land_mask, fill = "white", color = NA) +
+    
+    geom_tile(data = coldspots_df, aes(x = x, y = y, fill = factor(value))) +
+    scale_fill_manual(name = "Coldspot with\nNo Overlap", values = c("1" = "#288CBE"), 
+                      na.translate = FALSE, labels = "", guide = guide_legend(order = 1)) +
+    
+    new_scale_fill() +
+    
+    geom_tile(data = sps_df, aes(x = x, y = y, fill = value)) +
+    scale_fill_distiller(name = "No. of species\n(normalized)", palette = "YlOrRd", 
+                         direction = 1, limits = c(0, 1), guide = guide_colorbar(order = 2)) +
+    
+    geom_sf(data = mask_sf, fill = mask_fill, color = mask_color, linewidth = lw ) +
+    coord_sf(xlim = plot_xlim, ylim = plot_ylim, expand = FALSE) +
+    -
+    labs(title = col_header, subtitle = plot_title) +
+    
+
+ theme_void() +
+    theme(
+
+      panel.border = element_rect(color = "#3b3b3b", fill = NA, linewidth = .4),
+      plot.background = element_rect(fill = "white", color = NA),
+      
+      # Formatting the headers
+      plot.title = element_text(hjust = 0.5, size = 18, face = "bold", margin = margin(b = 8)),
+      plot.subtitle = element_text(hjust = 0.5, size = 14, margin = margin(b = 8)),
+      
+
+      plot.margin = margin(5, 5, 5, 5),
+      
+
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.key.height = unit(1.0, "cm"),  
+      legend.key.width = unit(.75, "cm"),  
+      legend.margin = margin(l = 10)         
+    )
+  
+  if (!is.null(phylo_img)) {
+    p <- p +
+      add_phylopic(img = phylo_img, x = icon_xpos, y = ypos, height = height_option * y_span, alpha = 1, color = "black") +
+      annotate("text", x = icon_xpos, y = text_y, label = n_species_char, hjust = 0.5, vjust = 1, size = 3)
+  } else {
+    p <- p +
+      annotate("text", x = icon_xpos, y = ypos, label = n_species_char, hjust = 0.5, vjust = 0.5, size = 4)
+  }
+  
+  return(p)
+}
+
+
+# Row 1: Top family per environment
+p_land_1 <- plot_family_overlap(path_land_1, path_cold_land, "land", "Terrestrial", .12, col_header = "LAND")
+p_sea_1  <- plot_family_overlap(path_sea_1,  path_cold_sea,  "sea",  "Marine", .1, col_header = "OCEAN")
+p_air_1  <- plot_family_overlap(path_air_1,  path_cold_air,  "air",  "Aerial", .12, col_header = "AIR")
+
+# Row 2: Second family per environment
+p_land_2 <- plot_family_overlap(path_land_2, path_cold_land, "land", "Terrestrial", .08)
+p_sea_2  <- plot_family_overlap(path_sea_2,  path_cold_sea,  "sea",  "Marine", .12)
+p_air_2  <- plot_family_overlap(path_air_2,  path_cold_air,  "air",  "Aerial", .12)
+
+
+top_families_grid <- (p_land_1 | p_sea_1 | p_air_1) / 
+                     (p_land_2 | p_sea_2 | p_air_2) +
+                     plot_layout(guides = "collect") 
+print(top_families_grid)
+ggsave(
+  filename = file.path(out_dir, "TopFamilies_Overlap_Grid_touchesv2.png"),
+  plot = top_families_grid,
+  width = 16, height = 8, dpi = 500
+)
+```
+
+
+
+
+csvs tables for top families 
+```{r}
+ #Pick the land version you prefer (with or without bats)
+# df_land <- read_csv("GHCN_terr/GHCN_overlap/mollweide_nobats/v2/coverage_results_Mollweide_GHCN_nobats.csv") %>% mutate(Environment = "Land")
+# df_land <- read_csv("GHCN_terr/GHCN_overlap/mollweide/v2/coverage_results_Mollweide_GHCN_all.csv") %>% mutate(Environment = "Land")
+# df_sea  <- read_csv("Argos/argo_overlap/mollweide/argo_coverage_results_Mollweide.csv") %>% mutate(Environment = "Sea")
+# df_air  <- read_csv("radio/mollweide/coverage_results_Mollweide_radio.csv") %>% mutate(Environment = "Air")
+
+# df_land <- read_csv("GHCN_terr/GHCN_overlap/mollweide_nobats_touches/coverage_results_Mollweide_GHCN_nobats_touches.csv") %>%
+#   mutate(Environment = "Land")
+
+
+#df_land <- read_csv("GHCN_terr/GHCN_overlap/mollweide_touches/coverage_results_Mollweide_GHCN_all_touches2.csv") %>%
+  df_land <- read_csv("GHCN_terr/GHCN_overlap/mollweide_nobats_touches/coverage_results_Mollweide_GHCN_nobats_touches1957.csv")%>%
+  mutate(Environment = "Land")
+#df_land <- read_csv("GHCN_terr/GHCN_overlap/mollweide_touches/coverage_results_Mollweide_GHCN_all_touches.csv") %>% mutate(Environment = "Land")
+df_sea  <- read_csv("Argos/argo_overlap/mollweide_touches/coverage_results_Mollweide_touches1957.csv") %>% mutate(Environment = "Sea")
+df_air  <- read_csv("radio/mollweide_touches/coverage_results_Mollweide_radio_touches_1957.csv") %>% mutate(Environment = "Air")
+# Combine them into one big dataset
+
+df_all <- bind_rows(df_land, df_sea, df_air)
+
+df_all$Environment <- factor(df_all$Environment, levels = c("Land", "Sea", "Air"))
+
+
+# GET TOP 5
+
+get_top_5 <- function(data, env, metric_col, value_name, family_name) {
+  data %>%
+    filter(Environment == env) %>%
+    arrange(desc(.data[[metric_col]])) %>%
+    slice_head(n = 5) %>%
+    mutate(Rank = row_number()) %>%
+   
+    select(Environment, Rank, !!family_name := family, !!value_name := all_of(metric_col))
+}
+
+
+#  EXTRACT TOP 5 BY RICHNESS & OVERLAP
+
+# Top 5 by Most Species
+richness_top5 <- bind_rows(
+  get_top_5(df_all, "Land", "num_species", "Species_Count", "Family_Most_Species"),
+  get_top_5(df_all, "Sea",  "num_species", "Species_Count", "Family_Most_Species"),
+  get_top_5(df_all, "Air",  "num_species", "Species_Count", "Family_Most_Species")
+)
+
+# Top 5 by Largest Overlap
+overlap_top5 <- bind_rows(
+  get_top_5(df_all, "Land", "overlap_area_km2", "Overlap_Area_km2", "Family_Largest_Overlap"),
+  get_top_5(df_all, "Sea",  "overlap_area_km2", "Overlap_Area_km2", "Family_Largest_Overlap"),
+  get_top_5(df_all, "Air",  "overlap_area_km2", "Overlap_Area_km2", "Family_Largest_Overlap")
+)
+
+
+# Join the two tables together by Environment and Rank
+publication_table <- richness_top5 %>%
+  inner_join(overlap_top5, by = c("Environment", "Rank")) %>%
+  arrange(Environment, Rank)
+
+
+print(publication_table)
+
+
+write_csv(publication_table, "Top5_Families_Pub_Table_bats_touches_1957.csv")
+
+```
+
+
+Figure 1 Annual Sampling Gaps and Gap Persistence
+
+
+```{r}
+
+# Common theme for the top row to keep everything aligned
+line_theme <- function() {
+  theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 18, face = "bold", margin = margin(b = 10)),
+      plot.subtitle = element_text(hjust = 0.5, size = 14, margin = margin(b = 10)),
+      plot.caption = element_text(hjust = 0, size = 8, color = "grey30", face = "italic"),
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
+      legend.title = element_text(size = 10)
+    )
+}
+# --- LAND (GHCN) ---
+df_land <- read.csv("/GHCN_terr/coldspots/ws_moll_gap_area_df.csv") %>% 
+  filter(class == "Un-sampled")
+
+p_line_land <- ggplot(df_land, aes(x = year, y = area_10k_km2)) +
+  geom_area(fill = "#1f3b99", alpha = 0.85) +
+  geom_line(color = "white", linewidth = 0.5) +
+  scale_x_continuous(breaks = seq(2010, 2024, by = 2)) +
+  scale_y_continuous(breaks = seq(9000, 10500, by = 250)) +
+  coord_cartesian(ylim = c(9000, 10500)) +
+  labs(
+    title = "LAND", 
+    subtitle = "GHCN",
+    y = expression("Area (×10"^4*" km"^2*")"), 
+    x = "Year",
+    caption = "*y-axis truncated to highlight variability",
+    tag = "Annual Sampling\nGaps" 
+  ) +
+  line_theme() +
+  theme(
+    legend.position = "none", 
+    plot.tag.position = "left",
+    plot.tag = element_text(size = 16, face = "bold", hjust = 1, margin = margin(r = 15)),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 25) 
+  ) 
+
+# --- SEA (Argo) ---
+df_sea <- read.csv("/Argos/argos_mollweide_gap_area_df.csv")
+
+p_line_sea <- ggplot(df_sea, aes(x = year, y = area_10k_km2, fill = class)) +
+  geom_area(position = "stack", alpha = 0.85) +
+  scale_fill_manual(name = "Gap Type", values = c("Un-sampled" = "#1f3b99", "Under-sampled" = "#cbb6f2")) +
+  scale_x_continuous(breaks = seq(2010, 2024, by = 2)) +
+  scale_y_continuous(breaks = seq(0, 25000, by = 5000)) +
+  labs(
+    title = "SEA", 
+    subtitle = "Argo",
+    y = expression("Area (×10"^4*" km"^2*")"),
+    x = "Year"
+  ) +
+  line_theme()
+
+# --- AIR (Radiosondes) ---
+df_air <- read.csv("/radio/coldspots/rs_moll_gap_area_df.csv")
+p_line_air <- ggplot(df_air, aes(x = year, y = area_10k_km2)) +
+  geom_area(fill = "#1f3b99", alpha = 0.85) +
+  geom_line(aes(y = area_10k_km2), color = "white", linewidth = 0.5) +
+  scale_x_continuous(breaks = seq(2010, 2024, by = 2)) +
+  scale_y_continuous(breaks = seq(30000, 36000, by = 1000)) +
+  coord_cartesian(ylim = c(30000, 36000)) +
+  labs(
+    title = "AIR", 
+    subtitle = "Radiosondes",
+    y = expression("Area (×10"^4*" km"^2*")"),
+    x = "Year",
+    caption = "*y-axis truncated to highlight variability"
+  ) +
+  line_theme() +
+  theme(legend.position = "none") 
+
+
+#  ROW 2: PERSISTENCE MAPS 
+
+get_mask_config <- function(env) {
+  if (env == "land") return(list(top_sf = ocean_mask, fill = "lightgrey", color = NA))
+  if (env == "sea")  return(list(top_sf = land_mask, fill = "lightgrey", color = NA))
+  return(list(top_sf = land_mask, fill = NA, color = "#3b3b3b")) # Air
+}
+
+plot_persistence <- function(raster_path, env, row_title = NULL, show_legend = TRUE, color_scheme = "custom") {
+  r_df <- as.data.frame(rast(raster_path), xy = TRUE, na.rm = TRUE)
+  colnames(r_df)[3] <- "value"
+  cfg <- get_mask_config(env)
+  
+  p <- ggplot() +
+    geom_sf(data = land_mask, fill = "white", color = NA) +
+    geom_tile(data = r_df, aes(x = x, y = y, fill = value))
+    
+  # Toggle for color palette
+  if (color_scheme == "RdYlBu") {
+    p <- p + scale_fill_distiller(
+      name = "Persistence", 
+      palette = "RdYlBu", 
+      direction = 1, 
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.2),
+      labels = scales::percent,
+      na.value = NA
+    )
+  } else if (color_scheme == "coldspot_hybrid") {
+    #  RdYlBu for 0-80%, coldspot blue for 80-100%
+  coldspot_hybrid_colors <- c(
+      "#d73027",  # 0% - Bright red (RdYlBu)
+      "#fc8d59",  # 20% - Orange (RdYlBu)
+      "#fee090",  # 40% - Light yellow (RdYlBu)
+      "#ffffbf",  # 60% - Pale yellow (RdYlBu)
+      "#e0f3f8",  # 70% - Very light blue (RdYlBu)
+      "#288CBE",  # 80% - Coldspot blue 
+      "#288CBE"   # 100% - Coldspot blue 
+    )
+    
+    
+    p <- p + scale_fill_gradientn(
+      name = "Persistence", 
+      colors = coldspot_hybrid_colors,
+      values = c(0, 0.2, 0.4, 0.6, 0.7, 0.8, 1),  
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.2),
+      labels = scales::percent,
+      na.value = NA
+    )
+  } else {
+    p <- p + scale_fill_gradientn(
+      name = "Persistence", 
+      colors = my_richness_colors, 
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.2),
+      labels = scales::percent,
+      na.value = NA
+    )
+  }
+    
+  p <- p + 
+    geom_sf(data = cfg$top_sf, fill = cfg$fill, color = cfg$color, linewidth = 0.2) +
+    coord_sf(ylim = c(-85, 85), expand = FALSE) +
+    labs(x = NULL, y = NULL, tag = row_title) + 
+    theme_void() +
+    theme(
+      panel.border = element_rect(color = "#3b3b3b", fill = NA, linewidth = 1),
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 9)
+    )
+  
+  if (!is.null(row_title)) {
+    p <- p + theme(
+      plot.tag.position = "left",
+      plot.tag = element_text(size = 16, face = "bold", hjust = 1, margin = margin(r = 15)),
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 25) 
+    )
+  }
+
+  if (!show_legend) {
+    p <- p + theme(legend.position = "none")
+  }
+  
+  return(p)
+}
+save_persistence_grid <- function(scheme, filename) {
+  
+  p_map_land <- plot_persistence("GHCN_terr/coldspots/ws_4326_gap_persist2.tif", "land", row_title = "Gap Persistence", show_legend = FALSE, color_scheme = scheme)
+  p_map_sea  <- plot_persistence("Argos/gap_persist_1res_4326.tif", "sea", row_title = NULL, show_legend = FALSE, color_scheme = scheme)
+  p_map_air  <- plot_persistence("radio/rs_gap_persist_res5_4326.tif", "air", row_title = NULL, show_legend = TRUE, color_scheme = scheme)
+
+  final_grid <- (p_line_land | p_line_sea | p_line_air) /
+                (p_map_land | p_map_sea | p_map_air) +
+                plot_layout(guides = "collect")
+
+  ggsave(
+    filename = file.path(out_dir, filename),
+    plot = final_grid,
+    width = 16, height = 8, dpi = 500
+  )
+  print(paste("Saved:", filename))
+}
+
+
+save_persistence_grid("coldspot_hybrid", "Figure_Gap_Persistence_Grid_ColdspotHybrid.png")
+
+```
+
+Tracking coldspots figure 4
+
+```{r}
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+states <- ne_states(returnclass = "sf")
+
+# Paths to coldspots (4326 for plotting)
+path_cold_land <- "GHCN_terr/coldspots/ws_4326_final_coldspot2.tif"
+path_cold_air  <- "radio/rs_coldspot_res5_80presist_4326.tif"
+
+out_dir <- "/plots/tracking"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+high_contrast_palette <- c("#4d004b", "#c51b7d", "#DE4968", "#fdae61", "#FFEA46")
+
+
+# PREP TRACKING DATA
+
+prep_daily <- function(raw_df) {
+  raw_df %>%
+    clean_names() %>%
+    mutate(date = as.Date(timestamp)) %>%
+    group_by(id = individual_local_identifier, date) %>%
+    summarise(
+      lon = median(location_long, na.rm = TRUE),
+      lat = median(location_lat, na.rm = TRUE),
+      n_fixes = n(),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(lon), !is.na(lat))
+}
+
+make_track_lines_sf <- function(daily_df) {
+  daily_df %>%
+    group_by(id) %>%
+    filter(n() >= 2) %>%
+    group_split() %>%
+    map_dfr(function(d) {
+      d <- d %>% arrange(date)
+      st_sf(
+        id = as.character(d$id[1]),
+        start_date = min(d$date, na.rm = TRUE),
+        end_date   = max(d$date, na.rm = TRUE),
+        n_points   = nrow(d),
+        geometry   = st_sfc(st_linestring(as.matrix(d[, c("lon", "lat")])), crs = 4326)
+      )
+    })
+}
+
+# Load and prep Caribou
+caribou_raw <- read.csv("tracking/Mountain caribou in British Columbia-radio-transmitter.csv")
+caribou_daily <- prep_daily(caribou_raw)
+tracks_sf_caribou <- make_track_lines_sf(caribou_daily)
+
+# Load and prep Storks
+gps_direct <- read_csv("tracking/MPIO white stork lifetime tracking data (2013-2014)-gps.csv", show_col_types = FALSE)
+stork_daily <- prep_daily(gps_direct)
+tracks_sf_stork <- make_track_lines_sf(stork_daily)
+
+
+plot_animal_tracks <- function(tracks_sf, title, coldspot_path = NULL, x_buffer = 3, y_buffer = 3, include_states = FALSE) {
+  
+  bbox <- st_bbox(tracks_sf)
+  xlim <- c(bbox["xmin"] - x_buffer, bbox["xmax"] + x_buffer)
+  ylim <- c(bbox["ymin"] - y_buffer, bbox["ymax"] + y_buffer)
+  
+  num_ids <- length(unique(tracks_sf$id))
+  track_colors <- colorRampPalette(high_contrast_palette)(num_ids)
+  
+  p <- ggplot() +
+    geom_sf(data = world, fill = "#f1f1f1", color = NA)
+  
+  if (!is.null(coldspot_path)) {
+    cold_r <- rast(coldspot_path)
+    crop_ext <- ext(xlim[1], xlim[2], ylim[1], ylim[2])
+    cold_r_cropped <- crop(cold_r, crop_ext)
+    
+    cold_df <- as.data.frame(cold_r_cropped, xy = TRUE, na.rm = TRUE)
+    colnames(cold_df)[3] <- "value"
+    
+    p <- p + 
+      geom_tile(data = cold_df, aes(x = x, y = y, fill = factor(value)), alpha = 0.65) +
+      scale_fill_manual(values = c("1" = "#288CBE"), guide = "none")
+  }
+  
+  p <- p + geom_sf(data = world, fill = NA, colour = "grey40", linewidth = 0.1)
+  
+  if (include_states) {
+    p <- p + geom_sf(data = states, fill = NA, colour = "grey50", linewidth = 0.1)
+  }
+  
+  p <- p +
+    geom_sf(data = tracks_sf, aes(colour = id), linewidth = 0.35, alpha = 0.9) +
+    scale_color_manual(values = track_colors, guide = "none") +
+    coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid = element_blank(),
+      plot.background = element_rect(fill = "white", color = NA)
+    ) +
+    labs(title = title, x = NULL, y = NULL)
+  
+  return(p)
+}
+
+
+# --- MAIN MAPS ---
+p_stork_main <- plot_animal_tracks(tracks_sf_stork, "Stork Migration & Air Gaps", 
+                                   coldspot_path = path_cold_air, 
+                                   x_buffer = 2, y_buffer = 2, include_states = FALSE)
+
+p_caribou_main <- plot_animal_tracks(tracks_sf_caribou, "Mountain Caribou & Land Gaps", 
+                                     coldspot_path = path_cold_land, 
+                                     x_buffer = 5.5, y_buffer = 3, include_states = TRUE)
+
+# --- CARIBOU INSET ---
+bbox_caribou <- st_bbox(tracks_sf_caribou)
+mini_xlim_c <- c(-170, -45)
+mini_ylim_c <- c(40, 80)
+cold_r_mini_c <- crop(rast(path_cold_land), ext(mini_xlim_c[1], mini_xlim_c[2], mini_ylim_c[1], mini_ylim_c[2]))
+cold_df_mini_c <- as.data.frame(cold_r_mini_c, xy = TRUE, na.rm = TRUE)
+colnames(cold_df_mini_c)[3] <- "value"
+
+p_mini_caribou <- ggplot() +
+  geom_sf(data = world, fill = "lightgray", color = NA) +
+  geom_tile(data = cold_df_mini_c, aes(x = x, y = y, fill = factor(value)), alpha = 0.65) +
+  scale_fill_manual(values = c("1" = "#288CBE"), guide = "none") +
+  geom_sf(data = world, fill = NA, color = "grey40", linewidth = 0.08) +
+  annotate("rect", xmin = bbox_caribou["xmin"] - 5.5, xmax = bbox_caribou["xmax"] + 5.5, 
+           ymin = bbox_caribou["ymin"] - 3, ymax = bbox_caribou["ymax"] + 3,
+           color = "#C20000", fill = NA, linewidth = .75) +
+  coord_sf(xlim = mini_xlim_c, ylim = mini_ylim_c, expand = FALSE) +
+  theme_void() + 
+  theme(panel.border = element_rect(color = "#3b3b3b", fill = NA, linewidth = 1),
+        plot.background = element_rect(fill = "white", color = NA))
+
+p_caribou_with_inset <- p_caribou_main + 
+  inset_element(p_mini_caribou, left = 0.65, bottom = 0.02, right = 0.98, top = 0.35)
+
+# --- STORK INSET ---
+bbox_stork <- st_bbox(tracks_sf_stork)
+mini_xlim_s <- c(-25, 65)
+mini_ylim_s <- c(-40, 60)
+cold_r_mini_s <- crop(rast(path_cold_air), ext(mini_xlim_s[1], mini_xlim_s[2], mini_ylim_s[1], mini_ylim_s[2]))
+cold_df_mini_s <- as.data.frame(cold_r_mini_s, xy = TRUE, na.rm = TRUE)
+colnames(cold_df_mini_s)[3] <- "value"
+
+p_mini_stork <- ggplot() +
+  geom_sf(data = world, fill = "lightgray", color = NA) +
+  geom_tile(data = cold_df_mini_s, aes(x = x, y = y, fill = factor(value)), alpha = 0.65) +
+  scale_fill_manual(values = c("1" = "#288CBE"), guide = "none") +
+  geom_sf(data = world, fill = NA, color = "grey40", linewidth = 0.08) +
+  annotate("rect", xmin = bbox_stork["xmin"] - 2, xmax = bbox_stork["xmax"] + 2, 
+           ymin = bbox_stork["ymin"] - 2, ymax = bbox_stork["ymax"] + 2,
+           color = "#C20000", fill = NA, linewidth = .75) +
+  coord_sf(xlim = mini_xlim_s, ylim = mini_ylim_s, expand = FALSE) +
+  theme_void() + 
+  theme(panel.border = element_rect(color = "#3b3b3b", fill = NA, linewidth = 1),
+        plot.background = element_rect(fill = "white", color = NA))
+
+p_stork_with_inset <- p_stork_main + 
+  inset_element(p_mini_stork, left = 0.02, bottom = 0.02, right = 0.35, top = 0.35)
+
+# PATCHWORK GRID
+
+final_figure <- p_stork_with_inset | p_caribou_with_inset
+
+ggsave(file.path(out_dir, "Tracking_Gaps_With_Insets.png"), final_figure, width = 12, height = 6, dpi = 500)
+```
+
+supplemental freshwater, terrestrial with exclusions, and aerial specichness richness resolution 1
+
+
+```{r}
+my_richness_colors <- c(
+  "#91c789", # Dark Green
+  "#ffffbf", # Pale Yellow
+  "#ffd490", # Light Orange
+  "#fdae61", # Solid Orange
+  "#c51b7d", # Deep Magenta
+  "#4d004b"  # Dark Purple
+)
+
+norm_direct <- "normalized/esri_4326_touches"
+norm_list <- list.files(norm_direct, pattern = "\\.tif$", full.names = TRUE)
+
+for (norm_path in norm_list) {
+  
+  base_title <- sub("\\.tif$", "", basename(norm_path))
+  
+  
+  clean_base <- sub("_4326touches$|_molltouches$|_4326$|_moll$", "", base_title)
+  print(clean_base)
+  
+
+  if (grepl("normalized_mean", clean_base)) {
+    metric_title <- "Family Richness"
+    legend_title <- "No. of species\n(normalized by family)"
+    analysis_part <- sub("_normalized_mean.*", "", clean_base)
+    
+  } else if (grepl("species_richness_normalized", clean_base)) {
+    metric_title <- "Species Richness Normalized"
+    legend_title <- "No. of species\n(normalized)"
+    analysis_part <- sub("_species_richness_normalized.*", "", clean_base)
+    
+  } else if (grepl("family_richness", clean_base)) {
+    metric_title <- "Family Richness"
+    legend_title <- "No. of families"
+    analysis_part <- sub("_family_richness.*", "", clean_base)
+    
+  } else {
+    metric_title <- "Species Richness"
+    legend_title <- "No. of species"
+    analysis_part <- sub("_species_richness.*", "", clean_base)
+  }
+
+
+  analysis_title <- str_to_title(gsub("_", " ", analysis_part))
+  
+  # Build the final Plot Title (norm_title)
+  if (grepl("Supp No Amphib", analysis_title)) {
+
+    analysis_title <- gsub(" Supp No Amphib", "", analysis_title)
+    # Add ychosen suffix
+    norm_title <- paste(analysis_title, metric_title, "(with exclusions)")
+    
+  } else if (grepl("No Bats", analysis_title)) {
+    # Clean up "No Bats" to have parentheses
+    analysis_title <- gsub(" No Bats", " (No Bats)", analysis_title)
+    norm_title <- paste(analysis_title, metric_title)
+    
+  } else {
+    # Standard groups (Marine, Terrestrial, Freshwater, etc)
+    norm_title <- paste(analysis_title, metric_title)
+  }
+  
+  # Load raster
+  norm_r <- rast(norm_path)
+  
+  # Transform masks to match raster CRS
+  ocean_mask_crs <- st_transform(ocean_mask, crs(norm_r))
+  land_mask_crs  <- st_transform(land_mask,  crs(norm_r))
+  
+
+  # Set default flags
+  draw_ocean_bg <- FALSE
+  draw_land_mask_top <- FALSE
+  draw_land_outline_top <- FALSE
+  
+  if (str_detect(tolower(norm_title), "marine")) {
+    # Marine maps get a solid gray land mask on top to hide coastal spill
+    draw_land_mask_top <- TRUE
+    
+  } else {
+    # Terrestrial (all versions), Freshwater, and Aerial
+
+    draw_ocean_bg <- TRUE
+ 
+    draw_land_outline_top <- TRUE
+  }
+
+
+  plot <- ggplot() +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white"),
+      plot.title = element_text(hjust = 0.5, size = 12),
+      legend.title = element_text(size = 8)
+    )
+
+  if (draw_ocean_bg) {
+    plot <- plot +
+      geom_sf(data = ocean_mask_crs, fill = "#d5d5d5", color = NA) # Clean light gray
+  }
+
+
+  plot <- plot +
+    geom_spatraster(data = norm_r) +
+    scale_fill_gradientn(name = legend_title, colors = my_richness_colors, na.value = NA) +
+    labs(title = norm_title)
+
+  if (draw_land_mask_top) {
+    # Solid gray land for Marine maps
+    plot <- plot +
+      geom_sf(data = land_mask_crs, fill = "#d5d5d5", color = "gray", size = 0.2)
+  }
+  
+  if (draw_land_outline_top) {
+    # Crisp outline for Terrestrial / Aerial / Freshwater
+    plot <- plot +
+      geom_sf(data = land_mask_crs, fill = NA, color = "#3b3b3b", size = 0.1, alpha = 0.4) 
+  }
+
+
+  plot <- plot + coord_sf(expand = FALSE)
+  
+  print(plot)
+  
+  out_direct <- paste0("plots/normalized/", base_title, "_colors4.png")
+  
+ 
+   ggsave(filename = out_direct, plot, width = 5, height = 3, dpi = 500)
+}
+```
+
+
+Individual overlap plots
+
+```{r}
+and_mask <- st_transform(ne_download(scale = "medium", type = "land", category = "physical", returnclass = "sf"), 4326)
+ocean_mask <- st_transform(ne_download(scale = "medium", type = "ocean", category = "physical", returnclass = "sf"), 4326)
+
+# The exact list of families from your tables
+
+
+target_families <- c("Bovidae", "Felidae", "Canidae", "Cervidae", "Phocidae", "Equidae", "Mustelidae",
+                     "Procellariidae", "Laridae", "Carcharhinidae", "Delphinidae", "Labridae", "Balaenopteridae", "Stercorariidae",
+                     "Accipitridae", "Anatidae", "Scolopacidae", "Oceanitidae", "Charadriidae")
+
+library(rphylopic)
+
+get_phylopic_img <- function(family_name) {
+  # Dictionary mapping families to the EXACT UUIDs from the URLs provided
+  uuid_dict <- list(
+    "Accipitridae"    = "a92be6af-cb30-4d55-a3b0-cc3016be6c6c",
+    "Anatidae"        = "97f833ff-fcd8-4113-8948-721c75372462",
+    "Balaenopteridae" = "fd8d3e5e-24a0-4aa2-9211-987ff86007dd",
+    "Bovidae"         = "dbf2f035-6c04-4c4f-a9aa-f01a1e35ea9c",
+    "Canidae"         = "4b31c74e-7fbb-4ec9-a96e-f5b281c2b9d4",
+    "Carcharhinidae"  = "49039ecb-e03b-4cdc-9c9a-0393bf0ffe99",
+    "Cervidae"        = "4b474bdd-24e0-428d-b1f0-6d221ffc6367",
+    "Charadriidae"    = "fcc3ea71-17d5-44cc-8b52-dea48a83c943",
+    "Delphinidae"     = "388e792c-f8fd-4bd8-ad38-e251b5244ac0",
+    "Equidae"         = "f7d817d0-d733-493d-bd4a-3f178e0760a8",
+    "Felidae"         = "3f8eff77-2868-4121-8d7d-a55ebdd49e04",
+    "Hydrobatidae"    = "d6668ea1-5914-4b05-abe9-fbc7562f83fc",
+    "Labridae"        = "b25eec2b-7397-49ea-a42b-4ffe6250870b",
+    "Laridae"         = "23eecd7f-89e1-45c5-9d8a-7c7f373d3af7",
+    "Mustelidae"      = "5e13bb38-4c9f-4c7a-9c5c-0597fd33e4ab",
+    "Phocidae"        = "10d73995-c697-405e-8ffd-fc9900d3a3cb",
+    "Procellariidae"  = "a8ecc1e9-f339-4d85-84c3-aa2fff47b2c1",
+    "Scolopacidae"    = "145b43ea-a9d7-4a98-8764-2ebefd6cefe8",
+    "Stercorariidae"  = "bc1b9b9b-0f3e-41b4-b342-cf669b69afa1"
+  )
+  
+  # 1. Try to get the exact UUID from our list
+  if (family_name %in% names(uuid_dict)) {
+    uuid <- uuid_dict[[family_name]]
+  } else {
+    # 2. Fallback: If it's a family not on the list (like Oceanitidae), search by name
+    search_name <- ifelse(family_name == "Oceanitidae", "Oceanites oceanicus", family_name)
+    uuid <- tryCatch({ get_uuid(name = search_name, n = 1) }, error = function(e) return(NULL))
+  }
+  
+  if (is.null(uuid) || is.na(uuid)) return(NULL)
+  
+  # Download the specific image
+  img <- tryCatch({ get_phylopic(uuid = uuid) }, error = function(e) return(NULL))
+  return(img)
+}
+# ==============================================================================
+# 2. MASTER PLOTTING FUNCTION
+# ==============================================================================
+generate_all_top_plots <- function(out_folder) {
+  dir.create(out_folder, recursive = TRUE, showWarnings = FALSE)
+  
+  # Define the configuration for all 3 realms
+  configs <- list(
+    list(
+      domain = "Land",
+      ov_dir = "GHCN_overlap/esri_4326_touches",
+      cold_path = "ws_4326_final_coldspot2.tif",
+      mask_sf = ocean_mask, mask_fill = "lightgrey", mask_col = "#3b3b3b", lw = 0.05,
+      xlim = c(-180, 180), ylim = c(-85, 85)
+    ),
+    list(
+      domain = "Ocean",
+      ov_dir = "argo_overlap/esri_4326",
+      cold_path = "final_coldspot_raster_1res_4326.tif",
+      mask_sf = land_mask, mask_fill = "lightgrey", mask_col = "#3b3b3b", lw = 0.05,
+      xlim = c(-176, 176), ylim = c(-85, 85)
+    ),
+    list(
+      domain = "Air",
+      ov_dir = "esri_4326",
+      cold_path = "/rs_coldspot_res5_80presist_4326.tif",
+      mask_sf = land_mask, mask_fill = NA, mask_col = "#696969", lw = 0.2,
+      xlim = c(-180, 180), ylim = c(-85, 85)
+    )
+  )
+  
+  # Loop through Land, Sea, and Air
+  for (cfg in configs) {
+    cat("\n=== Processing Domain:", cfg$domain, "===\n")
+    
+    # Load coldspot"#7F7F7F
+    coldspots <- rast(cfg$cold_path)
+    mask_proj <- st_transform(cfg$mask_sf, crs(coldspots))
+    
+    # Get files
+    all_files <- list.files(cfg$ov_dir, pattern = "\\.tif$", full.names = TRUE)
+    if (length(all_files) == 0) { message("No files found in ", cfg$ov_dir); next }
+    
+    # Standardize icon position calculations
+    x_span <- diff(cfg$xlim)
+    y_span <- diff(cfg$ylim)
+    icon_xpos <- cfg$xlim[2] - 0.08 * x_span  
+    ypos      <- cfg$ylim[1] + 0.16 * y_span 
+    text_y    <- ypos - 0.09 * y_span
+    
+    for (ov_file in all_files) {
+      base_title <- sub("\\.tif$", "", basename(ov_file))
+      family_name <- str_to_title(str_split(base_title, "_")[[1]][1])
+      
+     
+      if (!(family_name %in% target_families)) next
+      
+      message("  Plotting: ", family_name)
+      
+      ov_raster <- rast(ov_file)
+      ov_raster[ov_raster == 0] <- NA
+      
+      # Align coldspot specifically to this raster
+      cold_aligned <- resample(coldspots, ov_raster, method = "near")
+      cold_df <- as.data.frame(cold_aligned, xy = TRUE, na.rm = TRUE)
+      colnames(cold_df)[3] <- "value"
+      
+      n_species <- parse_number(base_title)
+      n_species_char <- paste0("(n=", n_species, ")")
+      plot_title <- paste0("**", cfg$domain, "** ", family_name, " ", n_species_char)
+      
+      sps_df <- as.data.frame(ov_raster, xy = TRUE, na.rm = TRUE)
+      colnames(sps_df)[3] <- "value"
+      
+      phylo_img <- get_phylopic_img(family_name)
+      
+      p <- ggplot() +
+        geom_tile(data = cold_df, aes(x = x, y = y, fill = factor(value))) +
+        scale_fill_manual(name = "Coldspot with\nNo Overlap", values = c("1" = "#288CBE"), 
+                          na.value = NA, labels = "", na.translate = FALSE, guide = guide_legend(order = 1)) +
+        new_scale_fill() +
+        geom_tile(data = sps_df, aes(x = x, y = y, fill = value)) +
+        scale_fill_distiller(name = "No. of species\n(normalized)", palette = "YlOrRd", direction = 1, limits=c(0,1), guide = guide_colorbar(order = 2)) +
+        geom_sf(data = mask_proj, fill = cfg$mask_fill, color = cfg$mask_col, linewidth = cfg$lw) +
+        coord_sf(xlim = cfg$xlim, ylim = cfg$ylim, expand = FALSE) +
+        labs(title = plot_title) +
+        theme(
+          panel.grid = element_blank(),
+          panel.background = element_rect(fill = "white", color = "black", linewidth = .2),
+          plot.background = element_rect(fill = "white", color = NA),
+          plot.title = element_markdown(hjust = 0.5, size = 12),
+          legend.title = element_text(size = 8),
+          legend.key = element_blank(),
+          plot.margin = margin(5, 15, 5, 5)
+        )
+      
+      if (!is.null(phylo_img)) {
+        p <- p +
+          add_phylopic(img = phylo_img, x = icon_xpos, y = ypos, height = 0.12 * y_span, alpha = 1, color = "black") +
+          annotate("text", x = icon_xpos, y = text_y, label = n_species_char, hjust = 0.5, vjust = 1, size = 3) 
+      } else {
+        p <- p +
+          annotate("text", x = icon_xpos, y = ypos, label = n_species_char, hjust = 0.5, vjust = 0.5, size = 4)
+      }
+      
+      
+      ggsave(file.path(out_folder, paste0(base_title, "_FinalPlot_1957.png")), p, width = 6, height = 3, dpi = 500)
+    }
+  }
+
+}
+
+
+output_folder <- "plots/Target_Family_Overlaps"
+
+generate_all_top_plots(output_folder)
+```
+

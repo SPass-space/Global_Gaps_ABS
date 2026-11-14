@@ -1,0 +1,294 @@
+---
+title: "argoFloats"
+output: html_document
+date: "2025-03-06"
+---
+
+------------------------------------------------------------------------
+This script obtains the active argos float locations and rasterizes them
+------------------------------------------------------------------------
+
+```{r}
+library(argoFloats)
+library(oce)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tools)
+library(sf)
+library(terra)
+library(rnaturalearth)
+```
+
+
+```{r}
+# get the argo float information
+indexargo <- getIndex(destdir = tempdir())
+
+argo_sub <- argoFloats::subset(indexargo, 1:2)
+```
+
+```{r}
+#put the argo floats information into a dataframe
+argo_df <- data.frame(float_file = indexargo[["file"]],  obs_date = indexargo[["date"]], date_update = indexargo[["date_update"]], ocean = indexargo[["ocean"]],prof_type = indexargo[["profiler_type"]],  institution = indexargo[["institution"]], lon = indexargo[["longitude"]], lat = indexargo[["latitude"]])
+
+#filter out observations that do not have longitude or latitude, a date, or a profile
+argo_df_complete <- argo_df %>%
+  filter(!is.na(lat) , !is.na(lon) , !is.na(float_file), !is.na(obs_date),
+  # filter out profiles with incorrect longitude and latitudes
+  lon >= (-180) & lon <= 180,  
+  lat >= (-90) & lat <= 90)
+```
+
+```{r}
+#make the points into an sf object
+argo_obj <- st_as_sf(argo_df_complete, coords = c("lon", "lat"), crs = 4326)
+
+
+plot(argo_obj[,1])
+```
+
+
+```{r}
+#extract unique float instrument id
+argo_df_complete$float_id <- gsub(".*?/(\\d+)/profiles/.*", "\\1", argo_df_complete$float_file)
+argo_df_complete$source <- gsub("/.*", "", argo_df_complete$float_file)
+
+
+
+```
+
+
+
+------------------------------------------------------------------------------------------------
+Create argo rasters for each year in mollweide for processing and 4326 for plotting purposes
+------------------------------------------------------------------------------------------------
+
+```{r}
+#write in out directory 
+out_directory <-  "argo/moll/res1/"
+
+## Filter data by year
+obs_years <- 2010:2024
+argo_df_complete$year <- year(argo_df_complete$obs_date)  # create variable year
+argo_df_complete<- filter(argo_df_complete, year %in% obs_years)
+
+
+#find the number of unique float instrument
+length(unique(argo_df_complete$float_id)) #15,774
+#number of profiles
+nrow(argo_df_complete) #2425873
+
+argo_stack <- c()
+#1 degree resolution
+argo_mask <- rast(ext(-180, 180, -90, 90), xmin = -180, xmax=180, ymin=-90, ymax =90,crs = "EPSG:4326", resolution = 1)
+argo_mask
+crs_moll <- st_crs("ESRI:54009")$wkt
+#get around same number of rows and columns
+argo_mask <- project(argo_mask, crs_moll, method = "near", res = 100000)
+argo_mask
+
+for (obs_year in obs_years){
+  print(obs_year)
+  
+  #subset for the specific year
+  argo_year_df <<- argo_df_complete %>%
+    filter(year == obs_year)
+  
+  #make data into an sf object
+  argo_obj_year <- st_as_sf(argo_year_df, coords = c("lon", "lat"), crs = 4326)
+  argo_obj_year <- st_transform(argo_obj_year, crs_moll)
+
+  argo_raster <- rasterize(vect(argo_obj_year), argo_mask, fun="sum", background = 0)
+  plot(argo_raster)
+  
+  argo_stack <- c(argo_stack, argo_raster)
+  
+  argo_name <- paste0("argo_profile_counts_moll_res1_", obs_year, ".tif")
+  out_name <- paste0(out_directory, argo_name)
+  print(out_name)
+
+  #add to stack
+  writeRaster(argo_raster, out_name, overwrite = TRUE)
+}
+argo_complete_sf <- st_as_sf(argo_df_complete, coords = c("lon", "lat"), crs = 4326)
+
+
+```
+
+```{r}
+#bring back in where saved argo raster files are located. Change "input path" to your folder.
+argo_list <- list.files(path = "input_path", pattern = "\\.tif$", full.names = TRUE)
+
+argo_stack <- rast(argo_list)
+```
+
+
+```{r}
+#create ocean mask
+ocean_mask <- ne_download(scale = "medium", type = "ocean", category = "physical", returnclass = "sf")
+
+#load in extent to rasterize 
+ocean_mask <- rasterize(vect(ocean_mask), rast("argo_profile_counts_4326_2017.tif"), field = 1)
+
+
+#reproject to argo floats crs_moll
+ocean_mask_moll <- project(ocean_mask, crs(rast(argo_list[[1]])))
+
+
+```
+
+
+
+```{r}
+
+argo_stack <- list.files("Argos/profile_counts", pattern = "\\.tif$", full.names = TRUE)
+argo_stack <- rast(argo_stack)
+ocean_mask <- ne_download(scale = "medium", type = "ocean", category = "physical", returnclass = "sf")
+
+
+plot(ocean_mask)
+
+ocean_mask <- rasterize(vect(ocean_mask), rast("Argos/argo_profile_counts_4326_2007.tif"), field = 1)
+
+crs_moll <- st_crs("ESRI:54009")$wkt
+
+ocean_mask_moll <- project(ocean_mask, crs_moll)
+ocean_mask_moll <- crop(ocean_mask_moll,rast(argo_stack[[1]] ))
+ocean_mask_moll <- resample(ocean_mask_moll,rast(argo_stack[[1]]), method = "bilinear" )
+
+res_xy <- res(argo_stack[[1]])  # in meters, e.g., c(xres, yres)
+cell_area_m2 <- res_xy[1] * res_xy[2]
+cell_area_km2 <- cell_area_m2 / 1e6
+
+#create an area raster in meters to find density distribution
+area_rast <- rast(argo_stack[[1]])
+values(area_rast) <- cell_area_km2
+
+
+gap_area_list <- list()
+undersampled_stack <- rast()
+
+for (i in 1:nlyr(argo_stack)) {
+  argo_rast <- argo_stack[[i]]
+  argo_rast <- mask(argo_rast, ocean_mask_moll)
+  plot(argo_rast)
+  
+  # Calculate density distribution of profiles per km²
+  density_rast <- argo_rast / area_rast
+  
+  # Get 20th percentile of nonzero values
+  vals <- values(density_rast, na.rm = TRUE)
+  vals <- vals[vals > 0]
+  q20 <- quantile(vals, probs = 0.20, na.rm = TRUE)
+  print(paste("Year:", 2010 + i - 1, "q20 =", q20))
+  
+  # Start with NA raster
+  un_under_rast <- density_rast
+  values(un_under_rast) <- NA
+  
+  # 1 = unsampled 
+  un_under_rast[density_rast == 0] <- 1
+  
+  # 2 = undersampled (greater than 0 and ≤ q20)
+  un_under_rast[density_rast > 0 & density_rast <= q20] <- 2
+  
+  # Store in stack
+  undersampled_stack <- c(undersampled_stack, un_under_rast)
+  
+  # Calculate gap areas
+  gap_area_unsampled <- global(area_rast * (un_under_rast == 1), sum, na.rm = TRUE)[1, 1]
+  gap_area_undersampled <- global(area_rast * (un_under_rast == 2), sum, na.rm = TRUE)[1, 1]
+  
+  # Save data of un-sampled and under-sampled per year
+  gap_freq <- data.frame(
+    value = c(1, 2),
+    year = 2010 + i - 1,
+    area_km2 = c(gap_area_unsampled, gap_area_undersampled)
+  )
+  
+  gap_area_list[[i]] <- gap_freq
+}
+
+names(undersampled_stack) <- paste0("year_", 2010:(2010 + nlyr(argo_stack) - 1))
+
+
+
+gap_persistence <- app(undersampled_stack, function(x) {
+  sum(!is.na(x) & x > 0) / length(x)
+})
+gap_persistence <- mask(gap_persistence, ocean_mask_moll)
+plot(gap_persistence)
+
+
+gap_persistence_4326 <- project(gap_persistence, 'epsg:4326', method = "near", res = 1)
+writeRaster(gap_persistence_4326, "gap_persist_1res_4326.tif", overwrite = TRUE)
+writeRaster(gap_persistence, "gap_persist_1res_moll.tif", overwrite = TRUE)
+plot(gap_persistence_4326)
+
+# Mask for high persistence (≥80%) across all the years
+coldspot_mask <- classify(gap_persistence, matrix(c(-Inf, 0.8, NA, 0.8, Inf, 1), ncol = 3, byrow = TRUE), right = FALSE)
+
+
+coldspot_patches <- patches(coldspot_mask, directions = 4)
+
+
+
+# Convert to polygons
+coldspot_polygons <- as.polygons(coldspot_mask, dissolve = TRUE)
+coldspot_disaggregated <- terra::disagg(coldspot_polygons)
+
+
+# Calculate area in km²
+cold_spot_sf <- st_as_sf(coldspot_disaggregated)
+cold_spot_sf$area_sf <- as.numeric(st_area(cold_spot_sf))/1e6
+
+
+# Filter for spots greater than 200,000 square kilometers
+large_coldspots_sf <- cold_spot_sf %>%
+  filter(area_sf > 200000)
+
+
+# Convert back to a raster
+final_cold_spot_raster <- rasterize(large_coldspots_sf, gap_persistence)
+plot(final_cold_spot_raster, col = "blue")
+
+
+res_km <- res(final_cold_spot_raster) / 1000  # convert meters to km
+cell_area_km2 <- prod(res_km)
+
+#Count the number of coldspot cells 
+n_cold_cells <- global(!is.na(final_cold_spot_raster), fun = "sum", na.rm = TRUE)
+
+#compute total coldspot area
+cold_area_km2 <- n_cold_cells * cell_area_km2
+cold_area_km2 <- global(final_cold_spot_raster == 1, "sum", na.rm = TRUE) * cell_area_km2
+
+print(cold_area_km2)
+print(sum(large_coldspots_sf$area_sf))
+
+
+#percent of area cold surface area eliminated
+print("previous area before filtering")
+print( sum(cold_spot_sf$area_sf))
+eliminated_area <- 1-(sum(large_coldspots_sf$area_sf)/ sum(cold_spot_sf$area_sf))
+print("eliminated area")
+print(eliminated_area)
+writeRaster(final_cold_spot_raster, "final_coldspot_raster_1resmoll.tif", overwrite = TRUE)
+final_cold_spot_raster_4326 <- project(final_cold_spot_raster, 'epsg:4326', res = 1, method = "near")
+ocean_mask_4326 <- rasterize(vect(ne_download(scale = "medium", type = "ocean", category = "physical", returnclass = "sf")), 
+                              final_cold_spot_raster_4326, field = 1)
+final_cold_spot_raster_4326 <- mask(final_cold_spot_raster_4326, ocean_mask_4326)
+writeRaster(final_cold_spot_raster_4326, "final_coldspot_raster_1res_4326.tif", overwrite = TRUE)
+plot(final_cold_spot_raster_4326)
+
+#make gap area dataframe
+gap_area_df <- bind_rows(gap_area_list) %>%
+  mutate(
+    class = factor(value, levels = c(1, 2), labels = c("Un-sampled", "Under-sampled")),
+    area_10k_km2 = area_km2 / 1e4  
+  )
+
+write.csv(gap_area_df, "argos_gap_area_df.csv")
+```
+

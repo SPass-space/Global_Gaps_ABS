@@ -1,0 +1,225 @@
+---
+title: "GHCN_overlap"
+output: html_document
+date: "2025-06-04"
+---
+-----------------------------------------------------------------------------------
+This script looks at the overlap of unique species maps and GHCN weather station cold spots
+-----------------------------------------------------------------------------------
+```{r}
+library(oce)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tools)
+library(sf)
+library(terra)
+library(rnaturalearth)
+library(ggnewscale)
+```
+
+
+
+```{r}
+
+# Bat families to exclude in the second run
+bat_families <- c("Pteropodidae", "Phyllostomidae", "Vespertilionidae", 
+                  "Molossidae", "Emballonuridae", "Megadermatidae",
+                  "Rhinolophidae", "Myzopodidae", "Noctilionidae")
+
+process_family_overlap <- function(fam_dir, coldspot_path, out_dir, expr_csv_path, proj_name, analysis_type = "terrestrial",
+                                   exclude_families = NULL, run_label = "") {
+  cat("\n======================================================\n")
+  cat("Starting Overlap Analysis for:", proj_name, run_label, "\n")
+  cat("======================================================\n")
+  
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  all_files <- list.files(fam_dir, pattern = "\\.tif$", full.names = TRUE)
+  fam_list <- all_files[grepl(analysis_type, basename(all_files))]
+  cat("Found", length(fam_list), "files matching '", analysis_type, "'\n")
+  
+  if (length(fam_list) == 0) stop("No family .tif files found in ", fam_dir)
+  
+  GHCN_coldspots <- rast(coldspot_path)
+  ref_rast <- GHCN_coldspots
+  area_rast <- cellSize(ref_rast, unit = "km")
+  
+  # GHCN_coldspots <- project(GHCN_coldspots, crs(ref_rast))
+  # GHCN_coldspots <- resample(GHCN_coldspots, ref_rast, method = "near")
+  
+  area_rast <- cellSize(ref_rast, unit = "km")
+  
+  family_df <- data.frame(
+    full_path = fam_list,
+    base_name = basename(fam_list),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(family_expression = base_name) %>%
+    mutate(family_expression = sub("\\.tif.*", '', family_expression)) %>%
+    mutate(family = sub("_.*","", family_expression)) %>%
+    mutate(expression_label = sub("^[^_]+_","", family_expression)) %>%
+    distinct()
+  
+  expression_df <- read.csv(expr_csv_path) %>%
+    select(-X) %>%
+    group_by(family, analysis) %>%
+    filter(analysis == analysis_type) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    distinct()
+  
+  fam_express_df <- left_join(family_df, expression_df, by = "family") %>%
+    filter(!is.na(count))
+  
+  # exclude families if specified
+  if (!is.null(exclude_families)) {
+    n_before <- nrow(fam_express_df)
+    fam_express_df <- fam_express_df %>% 
+      filter(!family %in% exclude_families)
+    n_after <- nrow(fam_express_df)
+    cat("Excluded", n_before - n_after, "families. Remaining:", n_after, "\n")
+  }
+  
+  coverage_results <- data.frame(
+    family = character(),
+    num_species = numeric(),
+    coverage_area_km2 = numeric(),
+    coldspot_area_km2 = numeric(),
+    overlap_area_km2 = numeric(),
+    overlap_percent = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:nrow(fam_express_df)) {
+    fam_file_path <- fam_express_df$full_path[i]
+    family_file <- fam_express_df$base_name[i]
+    fam_avail <- fam_express_df$family_expression[i]
+    num_species <- fam_express_df$count[i]
+    
+    if(is.na(num_species)) next 
+    
+    cat("Processing:", family_file, "(Species count:", num_species, ")\n")
+    
+    rast_layer <- rast(fam_file_path)
+    rast_layer <- project(rast_layer, crs(GHCN_coldspots))
+    rast_layer <- resample(rast_layer, GHCN_coldspots, method = "near")
+    
+    family_cells <- (!is.na(rast_layer) & rast_layer > 0)
+    coverage_area_km2 <- global(area_rast * family_cells, sum, na.rm = TRUE)[1,1]
+    
+    coldspot_area_km2 <- 93350000 # this number is obtained from the weather_stations.RMD script
+    
+    overlap_rast <- rast_layer * GHCN_coldspots
+    
+    overlap_cells <- (!is.na(overlap_rast) & overlap_rast > 0)
+    overlap_area_km2 <- global(area_rast * overlap_cells, sum, na.rm = TRUE)[1,1]
+    
+    overlap_percent <- (overlap_area_km2 / coldspot_area_km2) * 100
+    
+    coverage_results <- rbind(coverage_results, data.frame(
+      family = fam_avail,
+      num_species = num_species,
+      coverage_area_km2 = coverage_area_km2,
+      coldspot_area_km2 = coldspot_area_km2,
+      overlap_area_km2 = overlap_area_km2,
+      overlap_percent = round(overlap_percent, 2)
+    ))
+    
+   non_na_cells <- global(!is.na(overlap_rast), fun = "sum", na.rm = TRUE)[1,1]
+    
+    if (!is.na(non_na_cells) && non_na_cells > 0) {
+      
+      max_value <- global(overlap_rast, fun = "max", na.rm = TRUE)[1,1]
+      
+
+      min_value <- 0 
+      
+      if (!is.na(max_value) && max_value > min_value) {
+        overlap_rast <- (overlap_rast - min_value) / (max_value - min_value)
+      }
+      
+
+      overlap_rast[overlap_rast == 0] <- NA
+      
+      out_path <- file.path(out_dir, paste0(fam_avail, "_GHCN_overlap_", num_species, ".tif"))
+      cat("Overlap:", round(overlap_percent, 1), "% of coldspots. Saving to:", out_path, "\n")
+      writeRaster(overlap_rast, out_path, overwrite = TRUE)
+    } else {
+      cat("No overlap found. Skipping.\n")
+    }
+  }
+  
+  coverage_results <- coverage_results %>% arrange(desc(overlap_percent))
+  
+  cat("\n====== TOP 10 FAMILIES BY COLDSPOT OVERLAP ======\n")
+  print(head(coverage_results, 10))
+  
+  csv_path <- file.path(out_dir, paste0("coverage_results_", proj_name, "_GHCN", run_label, "_touches1957.csv"))
+  write.csv(coverage_results, csv_path, row.names = FALSE)
+  cat("Coverage results saved to:", csv_path, "\n")
+  
+  cat("\nFinished processing", proj_name, run_label, "!\n")
+  return(coverage_results)
+}
+
+# RUN THE FUNCTION WITH DESIRED PROJECTION AND BAT FAMILIES INCLUDED OR EXCLUDED
+
+
+
+
+expr_csv <- read.csv("expression_df_2026_1957.csv")
+
+# --- Mollweide: ALL families ---
+cov_moll_all <- process_family_overlap(
+  fam_dir = "family_maps/mollweide",
+  coldspot_path = "GHCN_terr/coldspots/ws_moll_final_coldspot2.tif",
+  out_dir = "GHCN_terr/GHCN_overlap/mollweide",
+  expr_csv_path = "expression_df_2026_1957.csv",
+  proj_name = "Mollweide",
+   analysis_type = "terrestrial",
+  exclude_families = NULL,
+  run_label = "_all"
+)
+
+# --- Mollweide: WITHOUT bats ---
+cov_moll_nobats <- process_family_overlap(
+  fam_dir = "family_maps/mollweide",
+  coldspot_path = "GHCN_terr/coldspots/ws_moll_final_coldspot2.tif",
+  out_dir = "GHCN_terr/GHCN_overlap/mollweide_nobats",
+  expr_csv_path = "expression_df_2026_1957.csv",
+  proj_name = "Mollweide",
+   analysis_type = "terrestrial",
+  exclude_families = bat_families,
+  run_label = "_nobats"
+)
+
+# --- EPSG:4326: ALL families ---
+cov_4326_all <- process_family_overlap(
+  fam_dir = "family_maps/esri_4326",
+  coldspot_path = "GHCN_terr/coldspots/ws_4326_final_coldspot2.tif",
+  out_dir = "GHCN_terr/GHCN_overlap/esri_4326",
+  expr_csv_path = "expression_df_2026_1957.csv",
+  proj_name = "EPSG4326",
+   analysis_type = "terrestrial",
+  exclude_families = NULL,
+  run_label = "_all"
+)
+
+# --- EPSG:4326: WITHOUT bats ---
+cov_4326_nobats <- process_family_overlap(
+  fam_dir = " family_maps/esri_4326",
+  coldspot_path = "GHCN_terr/coldspots/ws_4326_final_coldspot2.tif",
+  out_dir = "GHCN_terr/GHCN_overlap/esri_4326_nobats",
+  expr_csv_path = "expression_df_2026_1957.csv",
+  proj_name = "EPSG4326",
+   analysis_type = "terrestrial",
+  exclude_families = bat_families,
+  run_label = "_nobats"
+)
+
+
+```
+
+
+
+

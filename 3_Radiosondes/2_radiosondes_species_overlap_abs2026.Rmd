@@ -1,0 +1,189 @@
+---
+title: "radio_overlap"
+output: html_document
+date: "2025-06-04"
+---
+-----------------------------------------------------------------------------------
+This script looks at the overlap of unique species maps and radiosonde instrument coldspots
+-----------------------------------------------------------------------------------
+```{r}
+library(oce)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tools)
+library(sf)
+library(terra)
+library(rnaturalearth)
+library(ggnewscale)
+```
+
+
+
+
+```{r}
+process_family_overlap <- function(fam_dir, coldspot_path, out_dir, expr_csv_path, proj_name, analysis_type = "aerial",
+                                   exclude_families = NULL) {
+  
+  
+  cat("Overlap Analysis for:", proj_name, "\n")
+
+  
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  all_files <- list.files(fam_dir, pattern = "\\.tif$", full.names = TRUE)
+  fam_list <- all_files[grepl(analysis_type, basename(all_files))]
+  
+
+  if (analysis_type == "aerial") {
+    fam_list <- fam_list[!grepl("_1res", basename(fam_list))]
+    cat("Filtered out '_1res' files. Using 5-degree resolution only.\n")
+  }
+  
+  cat("Found", length(fam_list), "files to process.\n")
+  
+  if (length(fam_list) == 0) stop("No family .tif files found in ", fam_dir)
+  
+  radio_coldspots <- rast(coldspot_path)
+  
+
+  ref_rast <- rast(fam_list[[1]]) 
+  
+  radio_coldspots <- project(radio_coldspots, crs(ref_rast))
+  radio_coldspots <- resample(radio_coldspots, ref_rast, method = "near")
+  
+  area_rast <- cellSize(ref_rast, unit = "km")
+  
+  family_df <- data.frame(
+    full_path = fam_list,
+    base_name = basename(fam_list),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(family_expression = base_name) %>%
+    mutate(family_expression = sub("\\.tif.*", '', family_expression)) %>%
+    mutate(family = sub("_.*","", family_expression)) %>%
+    mutate(expression_label = sub("^[^_]+_","", family_expression)) %>%
+    distinct()
+  
+  expression_df <- read.csv(expr_csv_path) %>%
+    select(-X) %>%
+    group_by(family, analysis) %>%
+    filter(analysis == analysis_type) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    distinct()
+  
+  fam_express_df <- left_join(family_df, expression_df, by = "family") %>%
+    filter(!is.na(count))
+  
+  # EXCLUDE FAMILIES IF SPECIFIED
+  if (!is.null(exclude_families)) {
+    n_before <- nrow(fam_express_df)
+    fam_express_df <- fam_express_df %>% 
+      filter(!family %in% exclude_families)
+    n_after <- nrow(fam_express_df)
+    cat("Excluded", n_before - n_after, "families. Remaining:", n_after, "\n")
+  }
+  
+  coverage_results <- data.frame(
+    family = character(),
+    num_species = numeric(),
+    coverage_area_km2 = numeric(),
+    coldspot_area_km2 = numeric(),
+    overlap_area_km2 = numeric(),
+    overlap_percent = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  
+  
+  for (i in 1:nrow(fam_express_df)) {
+    fam_file_path <- fam_express_df$full_path[i]
+    family_file <- fam_express_df$base_name[i]
+    fam_avail <- fam_express_df$family_expression[i]
+    num_species <- fam_express_df$count[i]
+    
+    if(is.na(num_species)) next 
+    
+    cat("Processing:", family_file, "(Species count:", num_species, ")\n")
+    
+    rast_layer <- rast(fam_file_path)
+    
+    family_cells <- (!is.na(rast_layer) & rast_layer > 0)
+    coverage_area_km2 <- global(area_rast * family_cells, sum, na.rm = TRUE)[1,1]
+    
+   
+      coldspot_area_km2 <- 368779396 # calculated from previous method
+    overlap_rast <- rast_layer * radio_coldspots
+  
+    overlap_cells <- (!is.na(overlap_rast) & overlap_rast > 0)
+    overlap_area_km2 <- global(area_rast * overlap_cells, sum, na.rm = TRUE)[1,1]
+    
+    overlap_percent <- (overlap_area_km2 / coldspot_area_km2) * 100
+    
+    coverage_results <- rbind(coverage_results, data.frame(
+      family = fam_avail,
+      num_species = num_species,
+      coverage_area_km2 = coverage_area_km2,
+      coldspot_area_km2 = coldspot_area_km2,
+      overlap_area_km2 = overlap_area_km2,
+      overlap_percent = round(overlap_percent, 2)
+    ))
+    
+   non_na_cells <- global(!is.na(overlap_rast), fun = "sum", na.rm = TRUE)[1,1]
+    
+    if (!is.na(non_na_cells) && non_na_cells > 0) {
+      
+      max_value <- global(overlap_rast, fun = "max", na.rm = TRUE)[1,1]
+      
+      
+      min_value <- 0 
+      
+      if (!is.na(max_value) && max_value > min_value) {
+        overlap_rast <- (overlap_rast - min_value) / (max_value - min_value)
+      }
+      
+    
+      overlap_rast[overlap_rast == 0] <- NA
+      
+      out_path <- file.path(out_dir, paste0(fam_avail, "_radiooverlap_", num_species, ".tif"))
+      cat("Overlap:", round(overlap_percent, 1), "% of coldspots. Saving to:", out_path, "\n")
+      writeRaster(overlap_rast, out_path, overwrite = TRUE)
+    } else {
+      cat("No overlap found. Skipping.\n")
+    }
+  }
+  
+  coverage_results <- coverage_results %>% arrange(desc(overlap_percent))
+  
+  cat("\nTOP 10 FAMILIES BY COLDSPOT OVERLAP\n")
+  print(head(coverage_results, 10))
+  
+  csv_path <- file.path(out_dir, paste0("coverage_results_", proj_name, "_radio_touches_1957.csv"))
+  write.csv(coverage_results, csv_path, row.names = FALSE)
+  cat("Coverage results saved to:", csv_path, "\n")
+  
+  cat("\nFinished processing", proj_name, "!\n")
+  return(coverage_results)
+}
+
+expr_csv_path_name<- "expression_df_2026_1957.csv"
+
+# --- Mollweide: ALL families ---
+cov_moll_all <- process_family_overlap(
+  fam_dir = "family_maps/mollweide_touches",
+  coldspot_path = "radiosondes/rs_coldspot_res5_80presist_moll.tif",
+  out_dir = "radiosondes/mollweide",
+  expr_csv_path = expr_csv_path_name,
+  proj_name = "Mollweide",
+   analysis_type = "aerial",
+)
+
+# --- 4326: All families ---
+cov_moll_nobats <- process_family_overlap(
+  fam_dir = "family_maps/esri_4326",
+  coldspot_path = "radiosondes/rs_coldspot_res5_80presist_4326.tif",
+  out_dir = "radiosondes/esri_4326",
+   proj_name = "4326",
+   analysis_type = "aerial"
+)
+```

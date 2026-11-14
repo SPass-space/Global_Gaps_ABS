@@ -1,0 +1,194 @@
+---
+title: "ARGO_overlap"
+output: html_document
+date: "2025-06-04"
+---
+-----------------------------------------------------------------------------------
+This script looks at the overlap of unique species maps and argo floats cold spots
+-----------------------------------------------------------------------------------
+```{r}
+library(argoFloats)
+library(oce)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tools)
+library(sf)
+library(terra)
+```
+
+
+```{r}
+# Function to process overlap of argo cold spots and family maps
+process_family_overlap <- function(fam_dir, coldspot_path, out_dir, expr_csv_path, proj_name) {
+
+  cat("Starting Overlap Analysis for:", proj_name, "\n")
+ 
+  
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  #  Get list of family map rasters
+  fam_list <- list.files(fam_dir, pattern = "\\.tif$", full.names = TRUE)
+  if (length(fam_list) == 0) stop("No family .tif files found in ", fam_dir)
+  
+  #  Load and align the coldspot raster to the family maps
+  argo_coldspots <- rast(coldspot_path)
+  ref_rast <- argo_coldspots
+
+  
+  #  Create area raster for coverage calculations of overlap
+  area_rast <- cellSize(ref_rast, unit = "km")
+  
+ family_df <- data.frame(
+    full_path = fam_list,
+    base_name = basename(fam_list),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(family_expression = sub("\\.tif.*", '', base_name)) %>%
+    mutate(family = sub("_.*","", family_expression)) %>%
+   
+    # Extract the analysis type from filename and reads the marine tag
+    mutate(file_analysis = sub("^[^_]+_([^_]+).*", "\\1", family_expression)) %>%
+    distinct()
+  
+  #  Load and format expression dataframe to marine analysis only
+  expression_df <- read.csv(expr_csv_path) %>%
+    select(-X) %>%
+    filter(analysis == "marine") %>%
+    group_by(family, analysis) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    distinct()
+  
+  #  inner_join on  family AND analysis
+  fam_express_df <- inner_join(
+    family_df, 
+    expression_df, 
+    by = c("family" = "family", "file_analysis" = "analysis")
+  )
+  
+  #  Initialize coverage results dataframe
+  coverage_results <- data.frame(
+    family = character(),
+    num_species = numeric(),
+    coverage_area_km2 = numeric(),
+    coldspot_area_km2 = numeric(),
+    overlap_area_km2 = numeric(),
+    overlap_percent = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Loop through each family map
+  for (i in 1:nrow(fam_express_df)) {
+    fam_file_path <- fam_express_df$full_path[i]
+    print(fam_file_path)
+    family_file <- fam_express_df$base_name[i]
+    fam_avail <- fam_express_df$family_expression[i]
+    num_species <- fam_express_df$count[i]
+    
+    if(is.na(num_species)) next 
+    
+    cat("Processing:", family_file, "(Species count:", num_species, ")\n")
+    
+    rast_layer <- rast(fam_file_path)
+    print(crs(argo_coldspots))
+     rast_layer <- project(rast_layer, crs(argo_coldspots))
+    rast_layer <- resample(rast_layer, argo_coldspots, method = "near")
+
+    # Calculate total family coverage area (where species exist)
+    family_cells <- (!is.na(rast_layer) & rast_layer > 0)
+    coverage_area_km2 <- global(area_rast * family_cells, sum, na.rm = TRUE)[1,1]
+    
+    # Calculate total coldspot area
+    coldspot_area_km2 <- 45470000 # this value is calculated from the previous RMD
+    
+    # Mask to coldspot area 
+    overlap_rast <- rast_layer * argo_coldspots
+    
+    # Calculate overlap area (cells where family AND coldspot both exist)
+    overlap_cells <- (!is.na(overlap_rast) & overlap_rast > 0)
+    overlap_area_km2 <- global(area_rast * overlap_cells, sum, na.rm = TRUE)[1,1]
+    
+    # Calculate what percent of coldspot is covered by this family
+    overlap_percent <- (overlap_area_km2 / coldspot_area_km2) * 100
+    
+    # Add to coverage dataframe
+    coverage_results <- rbind(coverage_results, data.frame(
+      family = fam_avail,
+      num_species = num_species,
+      coverage_area_km2 = coverage_area_km2,
+      coldspot_area_km2 = coldspot_area_km2,
+      overlap_area_km2 = overlap_area_km2,
+      overlap_percent = round(overlap_percent, 2)
+    ))
+    
+   non_na_cells <- global(!is.na(overlap_rast), fun = "sum", na.rm = TRUE)[1,1]
+    
+    if (!is.na(non_na_cells) && non_na_cells > 0) {
+      
+      max_value <- global(overlap_rast, fun = "max", na.rm = TRUE)[1,1]
+      
+      # FIX: Force min_value to 0 so 1-species pixels don't become 0 and get deleted!
+      min_value <- 0 
+      
+      if (!is.na(max_value) && max_value > min_value) {
+        overlap_rast <- (overlap_rast - min_value) / (max_value - min_value)
+      }
+      
+      # Now, only true background 0s are deleted. Valid areas are kept!
+      overlap_rast[overlap_rast == 0] <- NA
+      
+      out_path <- file.path(out_dir, paste0(fam_avail, "_argo_overlap_", num_species, ".tif"))
+      cat("Overlap:", round(overlap_percent, 1), "% of coldspots. Saving to:", out_path, "\n")
+     # writeRaster(overlap_rast, out_path, overwrite = TRUE)
+    } else {
+      cat("  -> No overlap found. Skipping.\n")
+    }
+  }
+  
+  # Sort by overlap percentage and print summary
+  coverage_results <- coverage_results %>% arrange(desc(overlap_percent))
+  
+  cat("\n Top 10 families in Argo Coldspot overlap \n")
+  print(head(coverage_results, 10))
+  
+  # Save the coverage dataframe
+  csv_path <- file.path(out_dir, paste0("coverage_results_", proj_name, "_touches1947.csv"))
+  write.csv(coverage_results, csv_path, row.names = FALSE)
+  cat("Coverage results saved to:", csv_path, "\n")
+  
+  cat("\nFinished processing", proj_name, "!\n")
+  return(coverage_results)
+}
+
+
+
+# RUN FUNCTION FOR BOTH PROJECTIONS (for plots and accurate land measurements)
+
+
+# expression dataframe
+expr_csv <- "expression_df_2026_1957.csv"
+
+# --- Run mollweide ---
+coverage_moll <- process_family_overlap(
+  fam_dir = "family_maps/mollweide",
+  coldspot_path = "Argos/final_coldspot_raster_1resmoll.tif",
+  out_dir = "Argos/argo_overlap/",
+  expr_csv_path =  "expression_df_2026_1957.csv",
+  proj_name = "Mollweide"
+)
+
+# --- RUN EPSG:4326  ---
+coverage_4326 <- process_family_overlap(
+  fam_dir = "family_maps/esri_4326",
+  coldspot_path = "Argos/final_coldspot_raster_1res_4326.tif",
+  out_dir = "Argos/argo_overlap/esri_4326_touches",
+  expr_csv_path = "expression_df_2026_1957.csv",
+  proj_name = "EPSG4326"
+)
+
+
+```
+
+
+
+

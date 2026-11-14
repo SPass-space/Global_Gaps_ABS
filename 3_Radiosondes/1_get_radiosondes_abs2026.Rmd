@@ -1,0 +1,468 @@
+---
+title: "radiosondes2"
+author: "Stephanie Pass"
+date: "2025-07-15"
+output: html_document
+---
+
+
+----------------------------------------------------------------------------------------------------------
+This script if for gathering information from NOAA's Radiosondes around the globe. It rasterizes the points from 2010-2024.
+--------------------------------------------------------------------------------------------------------------
+
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(readr)
+library(tibble)
+library(dplyr)
+library(purrr)
+library(furrr)
+library(future)
+```
+
+
+
+```{r}
+
+# Read lines as plain text
+lines <- read_lines("https://www.ncei.noaa.gov/pub/data/igra/igra2-station-list.txt")
+
+# Split on whitespace (max 8 parts)
+data <- str_split_fixed(lines, "\\s+", 8)
+
+# Build tibble
+stations <- tibble(
+  station_id = data[, 1],
+  lat = as.numeric(data[, 2]),
+  lon = as.numeric(data[, 3]),
+  elev = as.numeric(data[, 4]),
+  name = data[, 5],
+  start_year = as.integer(data[, 6]),
+  end_year = as.integer(data[, 7]),
+  num_obs = as.integer(data[, 8])
+)
+
+# Fix for multi-word station names (e.g. LOS ANGELES INTL AP)
+bad_rows <- which(is.na(stations$start_year))
+for (i in bad_rows) {
+  # Rebuild name from multiple parts
+  parts <- str_split(lines[i], "\\s+")[[1]]
+  stations$name[i] <- paste(parts[5:(length(parts) - 3)], collapse = " ")
+  stations$start_year[i] <- as.integer(parts[length(parts) - 2])
+  stations$end_year[i] <- as.integer(parts[length(parts) - 1])
+  stations$num_obs[i] <- as.integer(parts[length(parts)])
+}
+
+
+```
+```{r}
+# Filter stations with data between 2010–2024
+stations_active <- stations %>%
+filter(start_year <= 2024, end_year >= 2010)
+# Get vector of station IDs
+station_ids <- stations_active$station_id
+
+#need to split into two parts since the data is so large
+active_stations_part1 <- stations_active %>%slice(1:558)
+active_stations_part2 <- stations_active %>% slice(559:n())
+
+
+active_stations_part1 <- stations_active %>%slice(1:3)
+active_stations_part2 <- stations_active %>% slice(550:555)
+
+
+```
+
+This section downloads the individual radiosonde instruments info to verify the years they were active
+
+```{r}
+
+
+#input the part of station you want to work with, then run this section with the other part
+active_stations_df_list <- list(active_stations_part1, active_stations_part2)
+
+# Base URL for data source
+base_url <- "https://www.ncei.noaa.gov/pub/data/igra/data/data-por/"
+
+# Output directory (create it if needed)
+output_dir <- "radiosonde/igra_dat_files"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Function to download and unzip each station file
+download_and_unzip_station <- function(station_id) {
+  file_name <- paste0(station_id, "-data.txt.zip")
+  full_url <- paste0(base_url, file_name)
+  dest_zip <- file.path(output_dir, file_name)
+  
+  tryCatch({
+    download.file(full_url, destfile = dest_zip, mode = "wb", quiet = TRUE)
+    message(paste("Downloaded:", file_name))
+    
+    # Unzip the file
+    unzip(dest_zip, exdir = output_dir)
+    message(paste("Unzipped:", file_name))
+  }, error = function(e) {
+    message(paste("Error with:", station_id, "—", e$message))
+  })
+}
+
+
+for (stn_df in active_stations_df_list){
+# Run the download + unzip function for each station
+stn_df$station_id %>%
+  walk(download_and_unzip_station)
+}
+
+```
+
+
+
+```{r}
+
+#Anlysis years
+years_to_check <- 2010:2024
+
+plan(multisession)
+
+
+
+get_active_years <- function(station_id) {
+  tryCatch({
+    file_path <- file.path(output_dir, paste0(station_id, "-data.txt"))
+
+    if (!file.exists(file_path)) {
+      warning(paste("File not found for", station_id))
+      return(rep(FALSE, length(years_to_check)))
+    }
+
+   
+    lines <- read_lines(file_path, progress = FALSE)
+
+    # Filter lines starting with the header
+    station_lines <- lines[str_detect(lines, paste0("^#", station_id))]
+
+    if (length(station_lines) == 0) {
+      message(paste("No header lines found for", station_id))
+      return(rep(FALSE, length(years_to_check)))
+    }
+
+    # Split lines by whitespace
+    line_splits <- str_split(station_lines, "\\s+")
+
+    # Extract year (2nd element)
+    years <- map_int(line_splits, ~ suppressWarnings(as.integer(.x[2])))
+    years <- years[!is.na(years)]
+
+    message(paste0("Station: ", station_id, " | Years found: ", paste(unique(years), collapse = ", ")))
+
+    active_flags <- years_to_check %in% years
+    return(active_flags)
+  }, error = function(e) {
+    warning(paste("Error with station:", station_id, "->", e$message))
+    return(rep(FALSE, length(years_to_check)))
+  })
+}
+
+
+
+# Process each dataframe and store results in a new list
+active_stations_with_years_list <- map(active_stations_df_list, function(stn_df) {
+  
+  active_year_matrix <- future_map(stn_df$station_id, get_active_years)
+  
+
+  active_year_matrix <- do.call(rbind, active_year_matrix)
+  colnames(active_year_matrix) <- as.character(years_to_check)
+
+  # Bind year columns to station dataframe
+  stn_df <- bind_cols(stn_df, as_tibble(active_year_matrix))
+  return(stn_df)
+})
+
+# Combine all the updated dataframes into one
+stations_active <- bind_rows(active_stations_with_years_list)
+
+
+
+print(stations_active)
+
+
+```
+
+
+
+```{r}
+
+
+year_cols <- as.character(2010:2024)
+year_numbers <- 2010:2024
+
+# check to make sure active years match range of years in dataframe 
+check_flag <- function(row) {
+  end <- row[["end_year"]]
+  year_values <- as.logical(row[year_cols])
+  
+
+  
+ 
+  if (any(year_values[years_after_end])) {
+    return("MISMATCH")
+  } else {
+    return("OK")
+  }
+}
+
+
+
+stations_active$flag <- apply(stations_active, 1, check_flag)
+
+
+
+write.csv(stations_active, "stations_active_flagged.csv")
+```
+
+
+
+```{r}
+active_stations_part2.5 <- active_stations_part2 %>%
+  filter(!station_id %in% missing_id_list)
+
+active_stations_part3 <- active_stations_part2 %>%
+  filter(station_id %in% missing_id_list)
+
+
+active_stations_part2.5 <- active_stations_part2.5 %>%
+  select( -X, -flag, - X2024) %>%
+  rename(flag = flag2)
+
+names(active_stations_part2.5) [8:22] <- as.character(2010:2024)
+
+names(active_stations_part1.5) [9:23] <- as.character(2010:2024)
+names(active_stations_part1.5)[24] <- "flag"
+
+active_stations_part1.5 <- active_stations_part1.5 %>%
+  select(-X)
+
+
+combined_stations <- full_join(active_stations_part1.5, active_stations_part2.5)
+
+combined_stations_filtered <- combined_stations2 %>%
+  filter(if_all('2010':'2024', ~. == FALSE))
+
+combined_stations2 <- full_join(combined_stations , active_stations_part3)
+
+
+
+#write.csv(combined_stations2, "radiosonde/stations_active_processed_all.csv")
+```
+
+
+
+
+
+```{r}
+
+stations_active_df <- read.csv("radiosonde/stations_active_processed_all.csv")
+
+  radio_complete <- stations_active_df %>%
+  select(-X)%>%
+  filter(!is.na(lat) , !is.na(lon) , !is.na(station_id),
+  # filter out profiles with incorrect longitude and latitudes
+  lon >= (-180) & lon <= 180,  
+  lat >= (-90) & lat <= 90)
+
+radio_stations_sf <- st_as_sf(radio_complete, coords = c("lon", "lat"), crs = "EPSG:4326")
+
+
+plot(radio_stations_sf[,1])
+```
+
+
+
+
+Make profile counts
+
+```{r}
+
+obs_years <- 2010:2024
+crs_moll <- st_crs("ESRI:54009")$wkt
+
+generate_profiles <- function(stations_sf, target_crs, deg_res, out_subdir) {
+  dir.create(out_subdir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Build the template based on the chosen resolution
+  template_4326 <- rast(ext(-180, 180, -90, 90), resolution = deg_res, crs = "EPSG:4326")
+  
+  if (target_crs == "EPSG:4326") {
+    template <- template_4326
+  } else {
+    # Convert degrees to approximate meters for Mollweide (1 degree ≈ 100,000 m, 5 degrees ≈ 500,000 )
+    meter_res <- deg_res * 100000
+    template <- project(template_4326, target_crs, method = "near", res = meter_res)
+  }
+  
+  radio_stack <- list()
+  for (year in obs_years) {
+    message("Processing year: ", year, " at ", deg_res, "-degree resolution")
+    year_col <- paste0("X", as.character(year))
+    
+    radio_active <- stations_sf %>% filter(.data[[year_col]] == TRUE)
+    radio_active <- st_transform(radio_active, target_crs)
+    
+    radio_rast <- rasterize(vect(radio_active), template, field = NA, fun = "sum", background = 0)
+    radio_stack[[year_col]] <- radio_rast
+  }
+  
+  radio_stack <- rast(radio_stack)
+  names(radio_stack) <- paste0("year_", obs_years)
+  
+  for (i in 1:nlyr(radio_stack)) {
+    writeRaster(radio_stack[[i]],
+                file.path(out_subdir, paste0("radio_counts_res", deg_res, "_", obs_years[i], ".tif")),
+                overwrite = TRUE)
+  }
+  return(radio_stack)
+}
+
+# ---
+# Fubction for both resolution and projections
+#---
+
+# --- 5-degree  ---
+generate_profiles(radio_stations_sf, crs_moll,    deg_res = 5, "radio/profiles/moll/res5")
+generate_profiles(radio_stations_sf, "EPSG:4326", deg_res = 5, "radio/profiles/esri4326/res5")
+
+# --- 1-degree  ---
+generate_profiles(radio_stations_sf, crs_moll,    deg_res = 1, "radio/profiles/moll/res1")
+generate_profiles(radio_stations_sf, "EPSG:4326", deg_res = 1, "radio/profiles/esri4326/res1")
+```
+
+
+
+Create Gap Persistence and ColdSpot Rasters
+
+```{r}
+out_directory <- "radio/coldspots/"
+dir.create(out_directory, recursive = TRUE, showWarnings = FALSE)
+
+process_radio_coldspots <- function(radio_dir, proj_name, out_prefix) {
+  print(paste("Processing Radiosondes:", proj_name))
+  
+  
+  all_files <- list.files(radio_dir, pattern = "\\.tif$", full.names = TRUE)
+  years_to_keep <- as.character(2010:2024)
+  radio_files <- all_files[grepl(paste(years_to_keep, collapse = "|"), all_files)]
+  if(length(radio_files) == 0) stop("No .tif files found in the directory!")
+  
+  #Read reference raster and align
+  ref_rast <- rast(radio_files[1])
+  ref_crs <- crs(ref_rast)
+  
+  aligned_rasters <- lapply(radio_files, function(f) {
+    r <- rast(f)
+    crs(r) <- ref_crs 
+    if(!ext(r) == ext(ref_rast) || any(res(r) != res(ref_rast))) {
+      r <- resample(r, ref_rast, method = "near") 
+    }
+    return(r)
+  })
+  
+  radio_stack <- rast(aligned_rasters)
+  
+  # Calculate Cell Area 
+  area_rast <- cellSize(radio_stack[[1]], unit = "km")
+  
+  gap_area_list <- list()
+  unsampled_list <- list() 
+  
+  # Loop through years to build yearly data frame
+  for (i in 1:nlyr(radio_stack)) {
+    radio_rast <- radio_stack[[i]]
+    
+    # Classify: 0 counts -> 1 (Un-sampled), >0 counts -> NA
+    unsamp_gap <- classify(radio_rast, matrix(c(-Inf, 0, 1, 0, Inf, NA), ncol = 3, byrow = TRUE))
+    
+    unsampled_list[[i]] <- unsamp_gap
+    
+    # Calculate gap area for THIS YEAR using true cell size
+    gap_area_unsampled <- global(area_rast * (unsamp_gap == 1), sum, na.rm = TRUE)[1, 1]
+    
+    gap_area_list[[i]] <- data.frame(
+      class = "Un-sampled",
+      year = 2010 + i - 1, 
+      area_km2 = gap_area_unsampled
+    )
+  }
+  
+  # Persistence
+  unsampled_stack <- rast(unsampled_list)
+  names(unsampled_stack) <- paste0("year_", 2010:2024)
+  
+  gap_persistence <- app(unsampled_stack, function(x) {
+    sum(!is.na(x) & x > 0) / length(x)
+  })
+  writeRaster(gap_persistence, paste0(out_directory, out_prefix, "_gap_persist.tif"), overwrite = TRUE)
+  
+  #  Raster-Based Patch Calculation 
+
+  # Coldspot Mask (>= 80%)
+  coldspot_mask <- classify(gap_persistence, matrix(c(-Inf, 0.8, NA, 0.8, Inf, 1), ncol = 3, byrow = TRUE), right = FALSE)
+  
+  # Group contiguous cells into patches
+  coldspot_patches <- patches(coldspot_mask, directions = 4)
+  
+  # Calculate the exact area of every patch directly in the raster
+  patch_areas <- zonal(area_rast, coldspot_patches, sum, na.rm = TRUE)
+  colnames(patch_areas) <- c("patch_id", "area_km2")
+  
+  pre_filter_area <- sum(patch_areas$area_km2)
+  
+  # Filter by size: > 200,000 km²
+  large_patch_ids <- patch_areas$patch_id[patch_areas$area_km2 > 200000]
+  
+  # Create Final Raster (Keep only the large patches)
+  final_cold_spot_raster <- ifel(coldspot_patches %in% large_patch_ids, 1, NA)
+  writeRaster(final_cold_spot_raster, paste0(out_directory, out_prefix, "_final_coldspot.tif"), overwrite = TRUE)
+  
+  #  Area Calculations
+  total_cold_area <- sum(patch_areas$area_km2[patch_areas$patch_id %in% large_patch_ids])
+  eliminated_area <- 1 - (total_cold_area / pre_filter_area)
+  
+  print(paste("Total Coldspot Area BEFORE filter (km2):", pre_filter_area))
+  print(paste("Total Large Coldspot Area (km2):", round(total_cold_area)))
+  print(paste("Proportion of area eliminated by filter:", eliminated_area))
+  
+  # Dataframe format
+  gap_area_df <- bind_rows(gap_area_list) %>%
+    mutate(
+      area_10k_km2 = area_km2 / 1e4,
+      projection = proj_name
+    )
+  
+  write.csv(gap_area_df, paste0(out_directory, out_prefix, "_gap_area_df.csv"), row.names = FALSE)
+  
+  return(gap_area_df)
+}
+
+# Run the functions
+df_moll <- process_radio_coldspots(
+  radio_dir = "/radio/profiles/moll", 
+  proj_name = "Mollweide", 
+  out_prefix = "rs_moll"
+)
+
+df_4326 <- process_radio_coldspots(
+  radio_dir = "/radio/profiles/esri4326", 
+  proj_name = "EPSG4326", 
+  out_prefix = "rs_4326"
+)
+```
+
+
+
+
+
+
