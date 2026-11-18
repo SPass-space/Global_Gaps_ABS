@@ -2,7 +2,7 @@
 
 This repository contains the R code used for the analysis in the manuscript 
 "Global opportunities to fill climate observation gaps with animal-borne sensors" 
-by [Author list]. [Manuscript status: in preparation].
+by Diego Ellis-Soto, Stephanie Pass, Morgan Gilmour, Liam U Taylor, Joao P. Teixeria, Marie J. Zahn, Antonio Ferraz. [Manuscript in preparation].
 
 ## Requirements
 
@@ -89,17 +89,12 @@ Licensed under the MIT license.
 
 ## Citation
 
-[Author list]. 2026. Global opportunities to fill climate observation gaps with 
-animal-borne sensors. [Journal, in preparation].
-
-## Acknowledgements
-
-[Funding sources, data providers, collaborators]
-
+Diego Ellis-Soto, Stephanie Pass, Morgan Gilmour, Liam U Taylor, Joao P. Teixeria, Marie J. Zahn, Antonio Ferraz. 2026. Global opportunities to fill climate observation gaps with 
+animal-borne sensors. [Manuscript in preparation].
 
 
 - Argo (2000). Argo float data and metadata from Global Data Assembly Centre (Argo GDAC). SEANOE. https://doi.org/10.17882/42182
 - Durre, I., Yin, X., Vose, R. S., Applequist, S., & Arnfield, J. (2016). Enhancing the Data Coverage in the Integrated Global Radiosonde Archive. *Journal of Atmospheric and Oceanic Technology*, 35(9), 1753-1770.
 - Kelley, D., Harbin, J., & Richards, C. (2021). argoFloats: An R package for analyzing Argo data. *Frontiers in Marine Science*, 8, 635922.
 - Menne, M. J., Durre, I., Vose, R. S., Gleason, B. E., & Houston, T. G. (2012). An overview of the Global Historical Climatology Network-Daily Database. *Journal of Atmospheric and Oceanic Technology*, 29(7), 897-910.
-- [Add Fumihiko et al., 2026 full citation here]
+
